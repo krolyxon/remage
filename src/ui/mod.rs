@@ -301,6 +301,14 @@ fn status_bar(
         .as_ref()
         .filter(|s| state.mode == Mode::Image && Some(s.path.as_path()) == state.queue.current())
     {
+        if let Some(pb) = &state.playback {
+            let at = format!("{}/{}", pb.index + 1, pb.len());
+            if !pb.animated {
+                info.push(format!("PAGE {at}"));
+            } else if !pb.playing {
+                info.push(format!("FRAME {at}"));
+            }
+        }
         info.push(s.format.to_string());
         info.push(format!("{}×{}", s.size[0], s.size[1]));
         info.push(format!("{}%", (state.view.scale() * 100.0).round()));

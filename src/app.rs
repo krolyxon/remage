@@ -2,7 +2,6 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
@@ -49,6 +48,8 @@ const CONFIG_ERROR_TIME: Duration = Duration::from_secs(3600);
 /// In the grid, the selected image decodes once the cursor has rested this long, so `<CR>`
 /// opens it at once without decoding everything the cursor passes over.
 const GRID_REST: Duration = Duration::from_millis(250);
+/// A scalable image is re-rendered for the zoom once the view has rested this long.
+const REFINE_DELAY: Duration = Duration::from_millis(150);
 /// Two clicks on the same thumbnail this close together open it.
 const DOUBLE_CLICK: Duration = Duration::from_millis(400);
 
@@ -73,6 +74,11 @@ pub enum UserEvent {
         px: u32,
         mtime: Option<SystemTime>,
         result: Result<Thumb, ThumbError>,
+    },
+    /// A sharper version of an image (SVG at the current zoom, a developed RAW).
+    Refined {
+        path: PathBuf,
+        result: Result<Arc<DecodedImage>, String>,
     },
     /// Output or the exit of a user command.
     Command { id: u64, event: exec::Event },
@@ -182,7 +188,6 @@ pub struct App {
     pool: Pool,
     proxy: EventLoopProxy<UserEvent>,
     cache: ImageCache,
-    max_dim: Arc<AtomicU32>,
     /// Decoded images whose result event is still in the loop's queue.
     arriving: Arc<Mutex<HashSet<PathBuf>>>,
     gfx: Option<Gfx>,
@@ -211,6 +216,12 @@ pub struct App {
     confirm: Option<(Job, exec::Prepared)>,
     subscribers: Vec<Subscriber>,
     published: Option<Published>,
+    /// A refinement waiting for the view to rest: (path, target size, since).
+    refine_wait: Option<(PathBuf, u32, Instant)>,
+    /// The image being refined.
+    refining: Option<PathBuf>,
+    /// Refinements that failed; not retried.
+    refine_failed: HashSet<PathBuf>,
     /// `quit-no-output` ran: `-o` prints nothing.
     no_output: bool,
     pub error: Option<anyhow::Error>,
@@ -239,8 +250,6 @@ impl App {
             pool: Pool::new(),
             proxy,
             cache,
-            // Until the GPU reports its limit; uploads re-check.
-            max_dim: Arc::new(AtomicU32::new(16384)),
             arriving: Arc::default(),
             gfx: None,
             uploads: VecDeque::new(),
@@ -262,6 +271,9 @@ impl App {
             confirm: None,
             subscribers: Vec::new(),
             published: None,
+            refine_wait: None,
+            refining: None,
+            refine_failed: HashSet::new(),
             no_output: false,
             error: None,
         };
@@ -281,14 +293,14 @@ impl App {
             return;
         }
         let proxy = self.proxy.clone();
-        let max_dim = self.max_dim.clone();
+        let opts = self.decode_options();
         let arriving = self.arriving.clone();
         let path = path.to_path_buf();
         self.pool
             .submit(JobKey::Decode(path.clone()), prio, move || {
                 let t = Instant::now();
                 let mtime = mtime(&path);
-                let result = decode::decode(&path, max_dim.load(Ordering::Relaxed))
+                let result = decode::decode(&path, &opts)
                     .map(Arc::new)
                     .map_err(|e| e.to_string());
                 log::debug!("decoded {} in {:.1?}", path.display(), t.elapsed());
@@ -299,6 +311,94 @@ impl App {
                     result,
                 });
             });
+    }
+
+    fn decode_options(&self) -> decode::Options {
+        let [w, h] = self.state.window();
+        let long = w.max(h) as u32;
+        decode::Options {
+            // Before the window exists, a typical screen.
+            target: if long > 1 { long } else { 2048 },
+            auto_orient: self.config.image.auto_orient,
+            color: self.config.image.color_management,
+        }
+    }
+
+    /// Whether the shown image should be re-rendered sharper for the current zoom. Waits for
+    /// the view to rest; returns when to check again.
+    fn check_refine(&mut self, now: Instant) -> Option<Instant> {
+        if self.state.mode != Mode::Image || self.state.view.is_animating(now) {
+            return None;
+        }
+        let path = self
+            .state
+            .shown
+            .as_ref()
+            .filter(|s| Some(s.path.as_path()) == self.state.queue.current())?
+            .path
+            .clone();
+        if self.refining.is_some() || self.refine_failed.contains(&path) {
+            return None;
+        }
+        let img = self.cache.get(&path)?;
+        let refine = img.refine.clone()?;
+        let source = img.source_size[0].max(img.source_size[1]) as f32;
+        let want = (source * self.state.view.scale()).round() as u32;
+        let Some(target) = refine.wants(img.size[0].max(img.size[1]), want) else {
+            self.refine_wait = None;
+            return None;
+        };
+        match &self.refine_wait {
+            Some((p, t, since)) if *p == path && *t == target => {
+                let at = *since + REFINE_DELAY;
+                if now < at {
+                    return Some(at);
+                }
+            }
+            _ => {
+                self.refine_wait = Some((path, target, now));
+                return Some(now + REFINE_DELAY);
+            }
+        }
+        self.refine_wait = None;
+        self.refining = Some(path.clone());
+        log::debug!("refining {} to {target} px", path.display());
+        let proxy = self.proxy.clone();
+        let opts = self.decode_options();
+        self.pool
+            .submit(JobKey::Refine(path.clone()), Priority::Current, move || {
+                let t = Instant::now();
+                let result = refine
+                    .run(&path, target, &opts)
+                    .map(Arc::new)
+                    .map_err(|e| format!("{e:#}"));
+                log::debug!("refined {} in {:.1?}", path.display(), t.elapsed());
+                let _ = proxy.send_event(UserEvent::Refined { path, result });
+            });
+        None
+    }
+
+    fn on_refined(&mut self, path: PathBuf, result: Result<Arc<DecodedImage>, String>) {
+        if self.refining.as_ref() == Some(&path) {
+            self.refining = None;
+        }
+        match result {
+            Ok(img) => {
+                let wanted = self.window_paths();
+                let keep: Vec<&Path> = wanted.iter().map(PathBuf::as_path).collect();
+                self.cache.insert(path.clone(), img.clone(), &keep);
+                let shown = self.state.shown.as_ref().is_some_and(|s| s.path == path);
+                if shown && let Some(g) = &mut self.gfx {
+                    // Same source size, so the view stays exactly where it is.
+                    g.renderer.upload(&path, &img, usize::MAX);
+                    g.window.request_redraw();
+                }
+            }
+            Err(e) => {
+                log::warn!("{}: {e}", path.display());
+                self.refine_failed.insert(path);
+            }
+        }
     }
 
     /// The current file and its preload neighbours, current first.
@@ -321,6 +421,9 @@ impl App {
         let now = Instant::now();
         if navigated {
             self.pool.bump_epoch();
+            // A pending refinement was for the image we left (and its job may be cancelled).
+            self.refine_wait = None;
+            self.refining = None;
         }
         let wanted = self.window_paths();
         self.update_title();
@@ -511,10 +614,10 @@ impl App {
             self.state.loading_since.get_or_insert(now);
             return;
         };
-        let img = fit_gpu(img, g.renderer.max_texture_dim());
         g.renderer.upload(path, &img, usize::MAX);
         self.uploads.retain(|(p, _)| p != path);
         self.state.show(path, img.source_size, img.format, now);
+        self.state.set_frames(img.delays(), img.animated, now);
         self.request_redraw();
     }
 
@@ -556,6 +659,7 @@ impl App {
         }
         let old = std::mem::replace(&mut self.config, loaded.config);
         let new = &self.config;
+        decode::set_decoders(&new.decoders);
         let mut settings = Settings::from_config(new);
         self.opts.overrides.apply(&mut settings);
         let preload_changed = settings.preload != self.state.settings.preload;
@@ -1260,6 +1364,21 @@ impl App {
         } else {
             self.state.loading_since.is_none()
         };
+        // An animation moved on (or a page turned): put that frame in the texture.
+        let frame = self.state.frame();
+        if let Some(path) = self
+            .state
+            .shown
+            .as_ref()
+            .filter(|_| self.state.mode == Mode::Image)
+            .map(|s| s.path.clone())
+            && let Some(g) = &self.gfx
+            && g.renderer.frame(&path).is_some_and(|f| f != frame)
+            && let Some(img) = self.cache.get(&path)
+            && let Some(g) = &mut self.gfx
+        {
+            g.renderer.show_frame(&path, &img, frame);
+        }
         let Some(g) = &mut self.gfx else { return };
         if !self.shown_window {
             g.window.set_visible(true);
@@ -1316,11 +1435,10 @@ impl App {
         if !self.thumbs.arrivals.is_empty() {
             return true;
         }
-        if let Some((path, img)) = self.uploads.front() {
-            let img = fit_gpu(img.clone(), g.renderer.max_texture_dim());
-            if g.renderer.upload(path, &img, UPLOAD_BUDGET) {
-                self.uploads.pop_front();
-            }
+        if let Some((path, img)) = self.uploads.front()
+            && g.renderer.upload(path, img, UPLOAD_BUDGET)
+        {
+            self.uploads.pop_front();
         }
         !self.uploads.is_empty()
     }
@@ -1365,29 +1483,6 @@ fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-/// Shrink an image that exceeds the GPU's texture limit (decoded before the limit was known).
-fn fit_gpu(img: Arc<DecodedImage>, max_dim: u32) -> Arc<DecodedImage> {
-    if img.size[0] <= max_dim && img.size[1] <= max_dim {
-        return img;
-    }
-    let owned = Arc::try_unwrap(img).unwrap_or_else(|a| DecodedImage {
-        pixels: a.pixels.clone(),
-        ..*a
-    });
-    match decode::downscale(owned, max_dim) {
-        Ok(small) => Arc::new(small),
-        Err(e) => {
-            log::error!("downscale: {e:#}");
-            Arc::new(DecodedImage {
-                size: [1, 1],
-                pixels: vec![0; 4],
-                format: "?",
-                source_size: [1, 1],
-            })
-        }
-    }
-}
-
 impl ApplicationHandler<UserEvent> for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         if self.gfx.is_some() {
@@ -1430,8 +1525,6 @@ impl ApplicationHandler<UserEvent> for App {
             }
         };
         log::debug!("GPU ready after {:.1?}", self.started.elapsed());
-        self.max_dim
-            .store(renderer.max_texture_dim(), Ordering::Relaxed);
         let size = window.inner_size();
         self.state.set_window(
             size.width as f32,
@@ -1481,6 +1574,7 @@ impl ApplicationHandler<UserEvent> for App {
                 mtime,
                 result,
             } => self.on_thumb(path, px, mtime, result),
+            UserEvent::Refined { path, result } => self.on_refined(path, result),
             UserEvent::Command { id, event } => self.on_command(id, event, event_loop),
             UserEvent::Refreshed(found) => self.on_refreshed(found),
             UserEvent::Ipc(inc) => self.on_ipc(inc, event_loop),
@@ -1606,6 +1700,9 @@ impl ApplicationHandler<UserEvent> for App {
         }
         if let Some(t) = self.ambiguous_since {
             let at = t + SEQUENCE_TIMEOUT;
+            next = Some(next.map_or(at, |n| n.min(at)));
+        }
+        if let Some(at) = self.check_refine(now) {
             next = Some(next.map_or(at, |n| n.min(at)));
         }
         if redraw {

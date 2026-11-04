@@ -1,4 +1,5 @@
-//! Image textures: incremental row uploads, GPU mipmaps, linear/nearest sampling.
+//! Image textures: incremental row uploads, GPU mipmaps, linear/nearest sampling, and tiles
+//! for images larger than the GPU's texture limit.
 
 use bytemuck::{Pod, Zeroable};
 use wgpu::util::DeviceExt;
@@ -30,11 +31,22 @@ pub struct AlphaStyle {
     pub radius: f32,
 }
 
-pub struct GpuImage {
+/// One texture of an image: all of it, or a tile of a huge one.
+struct Tile {
     texture: wgpu::Texture,
     bind_group: wgpu::BindGroup,
     uniforms: wgpu::Buffer,
+    origin: [u32; 2],
     size: [u32; 2],
+}
+
+pub struct GpuImage {
+    tiles: Vec<Tile>,
+    size: [u32; 2],
+    /// The frame these textures hold (or are being filled with).
+    frame: usize,
+    /// Upload progress: the tile being filled and its rows done.
+    tile: usize,
     rows_done: u32,
     ready: bool,
 }
@@ -43,6 +55,26 @@ impl GpuImage {
     pub fn is_ready(&self) -> bool {
         self.ready
     }
+
+    pub fn frame(&self) -> usize {
+        self.frame
+    }
+
+    pub fn size(&self) -> [u32; 2] {
+        self.size
+    }
+}
+
+/// Split `size` into tiles no larger than `max` on either side.
+pub fn tiles(size: [u32; 2], max: u32) -> Vec<([u32; 2], [u32; 2])> {
+    let max = max.max(1);
+    let mut out = Vec::new();
+    for y in (0..size[1].max(1)).step_by(max as usize) {
+        for x in (0..size[0].max(1)).step_by(max as usize) {
+            out.push(([x, y], [(size[0] - x).min(max), (size[1] - y).min(max)]));
+        }
+    }
+    out
 }
 
 pub struct ImagePipeline {
@@ -202,9 +234,31 @@ impl ImagePipeline {
         }
     }
 
-    /// Allocate a texture for `img`; fill it with [`ImagePipeline::upload`].
-    pub fn create(&self, device: &wgpu::Device, img: &DecodedImage) -> GpuImage {
-        let [w, h] = img.size;
+    /// Allocate textures for `img`, tiled at `max_dim`; fill them with [`ImagePipeline::upload`].
+    pub fn create(&self, device: &wgpu::Device, img: &DecodedImage, max_dim: u32) -> GpuImage {
+        let tiles = tiles(img.size, max_dim)
+            .into_iter()
+            .map(|(origin, size)| self.tile(device, origin, size))
+            .collect::<Vec<_>>();
+        if tiles.len() > 1 {
+            log::debug!(
+                "{}×{} image in {} tiles",
+                img.size[0],
+                img.size[1],
+                tiles.len()
+            );
+        }
+        GpuImage {
+            tiles,
+            size: img.size,
+            frame: 0,
+            tile: 0,
+            rows_done: 0,
+            ready: false,
+        }
+    }
+
+    fn tile(&self, device: &wgpu::Device, origin: [u32; 2], [w, h]: [u32; 2]) -> Tile {
         let mips = 32 - w.max(h).max(1).leading_zeros();
         let texture = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("image"),
@@ -242,14 +296,21 @@ impl ImagePipeline {
                 },
             ],
         });
-        GpuImage {
+        Tile {
             texture,
             bind_group,
             uniforms,
+            origin,
             size: [w, h],
-            rows_done: 0,
-            ready: false,
         }
+    }
+
+    /// Start filling the textures with another frame; finish with [`ImagePipeline::upload`].
+    pub fn restart(&self, gpu: &mut GpuImage, frame: usize) {
+        gpu.frame = frame;
+        gpu.tile = 0;
+        gpu.rows_done = 0;
+        gpu.ready = false;
     }
 
     /// Upload up to `budget` bytes of rows. Returns true once the image is complete.
@@ -261,42 +322,53 @@ impl ImagePipeline {
         img: &DecodedImage,
         budget: usize,
     ) -> bool {
-        if gpu.ready {
-            return true;
-        }
-        let [w, h] = gpu.size;
-        let row_bytes = w as usize * 4;
-        let rows = ((budget / row_bytes.max(1)) as u32).clamp(1, h - gpu.rows_done);
-        let start = gpu.rows_done as usize * row_bytes;
-        let end = start + rows as usize * row_bytes;
-        queue.write_texture(
-            wgpu::TexelCopyTextureInfo {
-                texture: &gpu.texture,
-                mip_level: 0,
-                origin: wgpu::Origin3d {
-                    x: 0,
-                    y: gpu.rows_done,
-                    z: 0,
+        let pixels = img.frame(gpu.frame);
+        let stride = img.size[0] as usize * 4;
+        let mut left = budget;
+        while !gpu.ready {
+            let tile = &gpu.tiles[gpu.tile];
+            let [w, h] = tile.size;
+            let row_bytes = w as usize * 4;
+            let rows = ((left / row_bytes.max(1)) as u32).clamp(1, h - gpu.rows_done);
+            let y = tile.origin[1] + gpu.rows_done;
+            let start = y as usize * stride + tile.origin[0] as usize * 4;
+            let end = start + (rows as usize - 1) * stride + row_bytes;
+            queue.write_texture(
+                wgpu::TexelCopyTextureInfo {
+                    texture: &tile.texture,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d {
+                        x: 0,
+                        y: gpu.rows_done,
+                        z: 0,
+                    },
+                    aspect: wgpu::TextureAspect::All,
                 },
-                aspect: wgpu::TextureAspect::All,
-            },
-            &img.pixels[start..end],
-            wgpu::TexelCopyBufferLayout {
-                offset: 0,
-                bytes_per_row: Some(row_bytes as u32),
-                rows_per_image: Some(rows),
-            },
-            wgpu::Extent3d {
-                width: w,
-                height: rows,
-                depth_or_array_layers: 1,
-            },
-        );
-        gpu.rows_done += rows;
-        if gpu.rows_done == h {
-            self.generate_mips(device, queue, &gpu.texture);
-            gpu.ready = true;
-        } else {
+                &pixels[start..end],
+                wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(stride as u32),
+                    rows_per_image: Some(rows),
+                },
+                wgpu::Extent3d {
+                    width: w,
+                    height: rows,
+                    depth_or_array_layers: 1,
+                },
+            );
+            gpu.rows_done += rows;
+            left = left.saturating_sub(rows as usize * row_bytes);
+            if gpu.rows_done == h {
+                self.generate_mips(device, queue, &gpu.tiles[gpu.tile].texture);
+                gpu.tile += 1;
+                gpu.rows_done = 0;
+                gpu.ready = gpu.tile == gpu.tiles.len();
+            }
+            if left == 0 {
+                break;
+            }
+        }
+        if !gpu.ready {
             queue.submit([]);
         }
         gpu.ready
@@ -363,21 +435,49 @@ impl ImagePipeline {
         alpha: f32,
         style: &AlphaStyle,
     ) {
-        let u = Uniforms {
-            m: affine.m,
-            t: affine.t,
-            viewport,
-            bg: style.bg,
-            dot: style.dot,
-            params: [alpha, style.mode as f32, style.cell, style.radius],
-        };
-        queue.write_buffer(&gpu.uniforms, 0, bytemuck::bytes_of(&u));
+        let [iw, ih] = [gpu.size[0] as f32, gpu.size[1] as f32];
+        let m = affine.m;
+        for tile in &gpu.tiles {
+            // The tile's corner and extent in the image's 0..1 coordinates.
+            let (u0, v0) = (tile.origin[0] as f32 / iw, tile.origin[1] as f32 / ih);
+            let (du, dv) = (tile.size[0] as f32 / iw, tile.size[1] as f32 / ih);
+            let u = Uniforms {
+                m: [m[0] * du, m[1] * dv, m[2] * du, m[3] * dv],
+                t: [
+                    affine.t[0] + m[0] * u0 + m[1] * v0,
+                    affine.t[1] + m[2] * u0 + m[3] * v0,
+                ],
+                viewport,
+                bg: style.bg,
+                dot: style.dot,
+                params: [alpha, style.mode as f32, style.cell, style.radius],
+            };
+            queue.write_buffer(&tile.uniforms, 0, bytemuck::bytes_of(&u));
+        }
     }
 
     pub fn draw(&self, pass: &mut wgpu::RenderPass<'_>, gpu: &GpuImage, nearest: bool) {
         pass.set_pipeline(&self.pipeline);
-        pass.set_bind_group(0, &gpu.bind_group, &[]);
         pass.set_bind_group(1, if nearest { &self.nearest } else { &self.linear }, &[]);
-        pass.draw(0..6, 0..1);
+        for tile in &gpu.tiles {
+            pass.set_bind_group(0, &tile.bind_group, &[]);
+            pass.draw(0..6, 0..1);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tiling_covers_the_image() {
+        assert_eq!(tiles([10, 5], 16), [([0, 0], [10, 5])]);
+        let t = tiles([10, 5], 4);
+        assert_eq!(t.len(), 6);
+        assert_eq!(t[2], ([8, 0], [2, 4]));
+        assert_eq!(t[5], ([8, 4], [2, 1]));
+        let area: u32 = t.iter().map(|(_, s)| s[0] * s[1]).sum();
+        assert_eq!(area, 50);
     }
 }

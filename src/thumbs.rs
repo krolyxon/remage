@@ -399,9 +399,17 @@ fn generate(path: &Path, max: u32) -> anyhow::Result<Generated> {
     if let Some(g) = jpeg_scaled(path, max)? {
         return Ok(g);
     }
-    let img = decode::decode(path, u32::MAX)?;
+    // Scalable and previewed sources (SVG, RAW) only need the bucket's size.
+    let opts = decode::Options {
+        target: max,
+        ..decode::Options::default()
+    };
+    let img = decode::decode(path, &opts)?;
     let source_size = img.source_size;
-    let DecodedImage { size, pixels, .. } = img;
+    let DecodedImage {
+        size, mut frames, ..
+    } = img;
+    let pixels = frames.swap_remove(0).pixels;
     let t = resize(Thumb { size, pixels }, max)?;
     Ok(Generated {
         size: t.size,

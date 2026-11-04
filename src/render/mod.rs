@@ -84,7 +84,14 @@ impl Renderer {
         let info = adapter.get_info();
         log::debug!("adapter: {} ({:?})", info.name, info.backend);
         let limits = wgpu::Limits::downlevel_defaults().using_resolution(adapter.limits());
-        let max_dim = limits.max_texture_dimension_2d;
+        // `REMAGE_MAX_TEXTURE` lowers the limit, to exercise tiling on any GPU.
+        let max_dim = std::env::var("REMAGE_MAX_TEXTURE")
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+            .filter(|v| *v >= 64)
+            .map_or(limits.max_texture_dimension_2d, |v| {
+                v.min(limits.max_texture_dimension_2d)
+            });
         let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
             label: Some("remage"),
             required_limits: limits,
@@ -145,10 +152,6 @@ impl Renderer {
         })
     }
 
-    pub fn max_texture_dim(&self) -> u32 {
-        self.max_dim
-    }
-
     pub fn resize(&mut self, width: u32, height: u32) {
         if width == 0 || height == 0 {
             return;
@@ -175,16 +178,42 @@ impl Renderer {
     }
 
     /// Upload up to `budget` bytes of `img`. Returns true once it is ready to draw.
+    /// A texture of another size (a re-rasterised SVG, a developed RAW) is replaced.
     pub fn upload(&mut self, path: &Path, img: &DecodedImage, budget: usize) -> bool {
+        if self
+            .textures
+            .get(path)
+            .is_some_and(|g| g.size() != img.size)
+        {
+            self.textures.remove(path);
+        }
         let gpu = match self.textures.get_mut(path) {
             Some(g) => g,
             None => {
-                let g = self.images.create(&self.device, img);
+                let g = self.images.create(&self.device, img, self.max_dim);
                 self.textures.entry(path.to_path_buf()).or_insert(g)
             }
         };
         self.images
             .upload(&self.device, &self.queue, gpu, img, budget)
+    }
+
+    /// The frame an image's textures hold.
+    pub fn frame(&self, path: &Path) -> Option<usize> {
+        self.textures.get(path).map(GpuImage::frame)
+    }
+
+    /// Replace the textures' contents with frame `frame` of `img`, in full.
+    pub fn show_frame(&mut self, path: &Path, img: &DecodedImage, frame: usize) {
+        let Some(gpu) = self.textures.get_mut(path) else {
+            return;
+        };
+        if gpu.size() != img.size {
+            return;
+        }
+        self.images.restart(gpu, frame);
+        self.images
+            .upload(&self.device, &self.queue, gpu, img, usize::MAX);
     }
 
     /// Start a fresh thumbnail atlas for `cell`-pixel thumbnails.

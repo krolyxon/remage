@@ -82,12 +82,7 @@ mod tests {
     use super::*;
 
     fn img(bytes: usize) -> Arc<DecodedImage> {
-        Arc::new(DecodedImage {
-            size: [1, 1],
-            pixels: vec![0; bytes],
-            format: "PNG",
-            source_size: [1, 1],
-        })
+        Arc::new(DecodedImage::still([1, 1], vec![0; bytes], "PNG"))
     }
 
     #[test]

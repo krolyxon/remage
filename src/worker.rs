@@ -32,6 +32,7 @@ impl Priority {
 pub enum JobKey {
     Decode(PathBuf),
     Thumb(PathBuf),
+    Refine(PathBuf),
 }
 
 type Work = Box<dyn FnOnce() + Send>;

@@ -71,6 +71,7 @@ fn main() -> anyhow::Result<()> {
     }
     log::debug!("config loaded after {:.1?}", started.elapsed());
     let cfg = &loaded.config;
+    decode::set_decoders(&cfg.decoders);
 
     let mut paths = cli.paths.clone();
     if cli.stdin {

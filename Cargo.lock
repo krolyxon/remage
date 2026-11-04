@@ -1665,6 +1665,7 @@ dependencies = [
  "jxl-oxide-common",
  "jxl-render",
  "jxl-threadpool",
+ "moxcms 0.8.1",
  "tracing",
 ]
 
@@ -3075,6 +3076,7 @@ dependencies = [
  "serde_json",
  "signal-hook",
  "thiserror 2.0.21",
+ "tiff",
  "toml 1.2.0+spec-1.1.0",
  "wgpu",
  "winit",

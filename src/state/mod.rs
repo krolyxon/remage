@@ -163,6 +163,32 @@ pub struct Shown {
     pub format: &'static str,
 }
 
+/// Frames of the image on screen: a timed animation, or the pages of a document.
+#[derive(Clone, Debug)]
+pub struct Playback {
+    pub delays: Vec<Duration>,
+    pub animated: bool,
+    pub index: usize,
+    pub playing: bool,
+    /// When the next animation frame is due.
+    next: Option<Instant>,
+}
+
+impl Playback {
+    pub fn len(&self) -> usize {
+        self.delays.len()
+    }
+
+    fn step(&mut self, delta: isize) {
+        let n = self.len() as isize;
+        self.index = (self.index as isize + delta).rem_euclid(n) as usize;
+    }
+
+    fn delay(&self) -> Duration {
+        self.delays[self.index].max(Duration::from_millis(10))
+    }
+}
+
 /// The previous image fading out under the new one.
 #[derive(Clone, Debug)]
 pub struct Fade {
@@ -226,6 +252,8 @@ pub struct AppState {
     pub nearest: Option<bool>,
     pub alpha_bg: AlphaBg,
     pub shown: Option<Shown>,
+    /// Frames of the shown image, when it has more than one.
+    pub playback: Option<Playback>,
     pub fade: Option<Fade>,
     pub loading_since: Option<Instant>,
     pub skipped: usize,
@@ -258,6 +286,7 @@ impl AppState {
             nearest: None,
             alpha_bg: AlphaBg::Dots,
             shown: None,
+            playback: None,
             fade: None,
             loading_since: None,
             skipped: 0,
@@ -392,6 +421,9 @@ impl AppState {
         self.holds.clear();
         match mode {
             Mode::Image => {
+                if let Some(pb) = self.playback.as_mut().filter(|p| p.playing) {
+                    pb.next = Some(now + pb.delay());
+                }
                 // Don't crossfade from whatever was open before the grid.
                 if self.shown.as_ref().map(|s| s.path.as_path()) != self.queue.current() {
                     self.clear_shown();
@@ -613,6 +645,22 @@ impl AppState {
                 );
             }
             Action::AlphaBgCycle => self.alpha_bg = self.alpha_bg.next(),
+            Action::Play(s) if has_image => match &mut self.playback {
+                Some(pb) if pb.animated => {
+                    pb.playing = switch(s, pb.playing);
+                    pb.next = pb.playing.then(|| now + pb.delay());
+                }
+                _ => self.notify("not animated", MsgKind::Info, now),
+            },
+            Action::NextFrame | Action::PrevFrame if has_image => match &mut self.playback {
+                Some(pb) => {
+                    pb.step(if action == Action::NextFrame { 1 } else { -1 });
+                    // Stepping an animation pauses it, so the frame stays put.
+                    pb.playing = false;
+                    pb.next = None;
+                }
+                None => self.notify("single frame", MsgKind::Info, now),
+            },
             Action::Fullscreen(s) => fx.fullscreen = Some(s),
             Action::Bar(s) => {
                 let bar = switch(s, self.bar);
@@ -652,12 +700,12 @@ impl AppState {
             | Action::Page(_)
             | Action::RowStart
             | Action::RowEnd
-            | Action::Scroll(..) => fx.redraw = false,
-            // Parsed and bindable now; they arrive with later milestones.
-            other @ (Action::NextFrame
-            | Action::PrevFrame
-            | Action::Adjust(..)
+            | Action::Scroll(..)
             | Action::Play(_)
+            | Action::NextFrame
+            | Action::PrevFrame => fx.redraw = false,
+            // Parsed and bindable now; they arrive with later milestones.
+            other @ (Action::Adjust(..)
             | Action::Slideshow(_)
             | Action::SlideshowDelay { .. }
             | Action::Info(_)
@@ -759,11 +807,35 @@ impl AppState {
             .reset(size, self.settings.fit, self.settings.zoom, now);
         self.loading_since = None;
         self.holds.clear();
+        self.playback = None;
+    }
+
+    /// The shown image has several frames: play an animation, or page through a document.
+    pub fn set_frames(&mut self, delays: Vec<Duration>, animated: bool, now: Instant) {
+        if delays.len() < 2 {
+            self.playback = None;
+            return;
+        }
+        let mut pb = Playback {
+            delays,
+            animated,
+            index: 0,
+            playing: animated,
+            next: None,
+        };
+        pb.next = animated.then(|| now + pb.delay());
+        self.playback = Some(pb);
+    }
+
+    /// The frame of the shown image to draw.
+    pub fn frame(&self) -> usize {
+        self.playback.as_ref().map_or(0, |p| p.index)
     }
 
     /// The current file can't be shown (or the queue emptied).
     pub fn clear_shown(&mut self) {
         self.shown = None;
+        self.playback = None;
         self.fade = None;
         self.loading_since = None;
     }
@@ -839,6 +911,29 @@ impl AppState {
             if now < at {
                 wake(at);
             }
+        }
+        // Animation frames: only while the image is on screen.
+        if self.mode == Mode::Image
+            && let Some(pb) = &mut self.playback
+            && let Some(mut next) = pb.next
+        {
+            if now >= next {
+                let before = pb.index;
+                // Catch up on missed frames, but after a long stall just carry on from now.
+                for _ in 0..pb.len() {
+                    if now < next {
+                        break;
+                    }
+                    pb.step(1);
+                    next += pb.delay();
+                }
+                if now >= next {
+                    next = now + pb.delay();
+                }
+                pb.next = Some(next);
+                redraw |= pb.index != before;
+            }
+            wake(next);
         }
         if self.fade.as_ref().is_some_and(|f| !f.alpha.is_active(now)) {
             self.fade = None;
@@ -1014,6 +1109,37 @@ mod tests {
         assert_eq!(s.grid.size, 320);
         assert!(!s.apply(Action::GridSize(1), now).redraw);
         assert_eq!(s.cell_px(), 320);
+    }
+
+    #[test]
+    fn animation_plays_steps_and_pauses() {
+        let (mut s, now) = state(1);
+        s.show(Path::new("0.png"), [10, 10], "GIF", now);
+        let ms = Duration::from_millis;
+        s.set_frames(vec![ms(100), ms(50), ms(100)], true, now);
+        assert_eq!(s.frame(), 0);
+        assert_eq!(s.tick(now + ms(10)).1, Some(now + ms(100)));
+        assert!(s.tick(now + ms(100)).0);
+        assert_eq!(s.frame(), 1);
+        // Late: catch up through frame 1's 50 ms into frame 2.
+        s.tick(now + ms(160));
+        assert_eq!(s.frame(), 2);
+        s.apply(Action::Play(Switch::Toggle), now);
+        assert!(!s.tick(now + ms(5000)).0, "paused");
+        s.apply(Action::NextFrame, now);
+        assert_eq!(s.frame(), 0);
+        s.apply(Action::PrevFrame, now);
+        assert_eq!(s.frame(), 2);
+        // Pages step but never play.
+        s.set_frames(vec![Duration::ZERO; 3], false, now);
+        assert!(!s.playback.as_ref().unwrap().playing);
+        s.apply(Action::Play(Switch::On), now);
+        assert_eq!(s.message.as_ref().unwrap().text, "not animated");
+        s.apply(Action::NextFrame, now);
+        assert_eq!(s.frame(), 1);
+        // A new image starts without frames.
+        s.show(Path::new("1.png"), [10, 10], "PNG", now);
+        assert!(s.playback.is_none());
     }
 
     #[test]
