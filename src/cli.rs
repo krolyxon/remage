@@ -17,6 +17,14 @@ pub struct Cli {
     #[arg(short, long)]
     pub recursive: bool,
 
+    /// Start in the thumbnail grid
+    #[arg(short = 't', long)]
+    pub grid: bool,
+
+    /// Read the shared thumbnail cache but never write to it
+    #[arg(short = 'p', long)]
+    pub private: bool,
+
     /// Start at the Nth image (1-based)
     #[arg(short = 'n', long, value_name = "N")]
     pub start: Option<usize>,

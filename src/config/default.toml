@@ -140,13 +140,34 @@ preset = "nothing-dark"   # nothing-dark | nothing-light
 "<ScrollUp>" = "zoom in"
 "<ScrollDown>" = "zoom out"
 
+# In the grid a click selects a thumbnail and a double-click opens it; dragging scrolls.
 [keys.grid]
+"h" = "move left"
+"j" = "move down"
+"k" = "move up"
+"l" = "move right"
+"<Left>" = "move left"
+"<Down>" = "move down"
+"<Up>" = "move up"
+"<Right>" = "move right"
+"<C-d>" = "page half-down"
+"<C-u>" = "page half-up"
+"<C-f>" = "page down"
+"<C-b>" = "page up"
+"<PageDown>" = "page down"
+"<PageUp>" = "page up"
+"0" = "row-start"
+"^" = "row-start"
+"$" = "row-end"
 "+" = "grid-size +"
 "-" = "grid-size -"
 "v" = "visual"
+"<ScrollUp>" = "scroll up"
+"<ScrollDown>" = "scroll down"
 
 [keys.visual]
 "m" = "mark on"
+"v" = "mode grid"
 "<Esc>" = "mode grid"
 
 # User commands: bind them as "run <name>"; unbound ones still show in the : palette.

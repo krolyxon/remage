@@ -1,5 +1,6 @@
 //! wgpu device and surface setup, and per-frame orchestration.
 
+pub mod atlas;
 pub mod image;
 pub mod prims;
 pub mod text;
@@ -14,6 +15,8 @@ use winit::window::Window;
 use crate::config::theme::Rgba;
 use crate::decode::DecodedImage;
 use crate::state::view::Affine;
+use crate::thumbs::Thumb;
+use atlas::{Atlas, ThumbDraw};
 use image::{AlphaStyle, GpuImage, ImagePipeline};
 use prims::{Prim, PrimPipeline};
 use text::{TextItem, TextSystem};
@@ -32,6 +35,10 @@ pub struct Scene<'a> {
     pub image_clip: [f32; 4],
     pub alpha: AlphaStyle,
     pub images: Vec<ImageDraw<'a>>,
+    /// Grid thumbnails, clipped like images.
+    pub thumbs: Vec<ThumbDraw<'a>>,
+    /// Drawn before images and thumbnails (clipped like them), e.g. selection backgrounds.
+    pub under: Vec<Prim>,
     pub prims: Vec<Prim>,
     pub texts: Vec<TextItem>,
 }
@@ -46,6 +53,7 @@ pub struct Renderer {
     view_format: wgpu::TextureFormat,
     images: ImagePipeline,
     prims: PrimPipeline,
+    atlas: Atlas,
     text: TextSystem,
     textures: HashMap<PathBuf, GpuImage>,
     max_dim: u32,
@@ -123,6 +131,7 @@ impl Renderer {
         Ok(Self {
             images: ImagePipeline::new(&device, view_format),
             prims: PrimPipeline::new(&device, view_format),
+            atlas: Atlas::new(&device, view_format, max_dim),
             text: TextSystem::new(&device, &queue, view_format),
             window,
             instance,
@@ -176,6 +185,26 @@ impl Renderer {
         };
         self.images
             .upload(&self.device, &self.queue, gpu, img, budget)
+    }
+
+    /// Start a fresh thumbnail atlas for `cell`-pixel thumbnails.
+    pub fn reset_thumbs(&mut self, cell: u32) {
+        self.atlas.reset(cell);
+    }
+
+    pub fn has_thumb(&self, path: &Path) -> bool {
+        self.atlas.contains(path)
+    }
+
+    /// Put a thumbnail in the atlas. Returns the paths evicted to make room.
+    pub fn insert_thumb(
+        &mut self,
+        path: &Path,
+        thumb: &Thumb,
+        wanted: impl Fn(&Path) -> bool,
+    ) -> Vec<PathBuf> {
+        self.atlas
+            .insert(&self.device, &self.queue, path, thumb, wanted)
     }
 
     /// Drop textures that are no longer wanted.
@@ -242,8 +271,15 @@ impl Renderer {
             self.images
                 .prepare(&self.queue, gpu, d.affine, viewport, d.alpha, &scene.alpha);
         }
-        self.prims
-            .prepare(&self.device, &self.queue, &scene.prims, viewport);
+        self.atlas
+            .prepare(&self.device, &self.queue, &scene.thumbs, viewport);
+        self.prims.prepare(
+            &self.device,
+            &self.queue,
+            &scene.under,
+            &scene.prims,
+            viewport,
+        );
         self.text
             .prepare(&self.device, &self.queue, &scene.texts, size)?;
 
@@ -277,12 +313,14 @@ impl Renderer {
             });
             if let Some((x, y, w, h)) = clip(scene.image_clip, size) {
                 pass.set_scissor_rect(x, y, w, h);
+                self.prims.draw_under(&mut pass);
                 for (d, gpu) in &draws {
                     self.images.draw(&mut pass, gpu, d.nearest);
                 }
+                self.atlas.draw(&mut pass);
                 pass.set_scissor_rect(0, 0, size[0], size[1]);
             }
-            self.prims.draw(&mut pass);
+            self.prims.draw_over(&mut pass);
             self.text.render(&mut pass)?;
         }
         Ok(encoder.finish())

@@ -13,7 +13,7 @@ use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoopProxy};
 use winit::keyboard::{ModifiersState, PhysicalKey};
 use winit::window::{Fullscreen, Window, WindowId};
 
-use crate::action::{Action, Switch, Zoom};
+use crate::action::{Action, ModeArg, Switch, Zoom};
 use crate::cache::ImageCache;
 use crate::config::watch::ConfigWatch;
 use crate::config::{Config, LoadError, Loaded};
@@ -24,7 +24,8 @@ use crate::input::{self};
 use crate::render::{Renderer, text};
 use crate::scan;
 use crate::state::view::{Dir, FitMode};
-use crate::state::{AppState, Effects, MsgKind, Settings};
+use crate::state::{AppState, Effects, Mode, MsgKind, Settings};
+use crate::thumbs::{self, CacheOptions, Thumb, ThumbError};
 use crate::ui;
 use crate::worker::{JobKey, Pool, Priority};
 
@@ -41,6 +42,11 @@ const SEQUENCE_TIMEOUT: Duration = Duration::from_millis(1000);
 const CLICK_SLOP: f32 = 4.0;
 /// Config errors stay on screen until fixed (or dismissed with `<Esc>`).
 const CONFIG_ERROR_TIME: Duration = Duration::from_secs(3600);
+/// In the grid, the selected image decodes once the cursor has rested this long, so `<CR>`
+/// opens it at once without decoding everything the cursor passes over.
+const GRID_REST: Duration = Duration::from_millis(250);
+/// Two clicks on the same thumbnail this close together open it.
+const DOUBLE_CLICK: Duration = Duration::from_millis(400);
 
 pub enum UserEvent {
     Decoded {
@@ -55,6 +61,12 @@ pub enum UserEvent {
     Config(Box<Result<Loaded, LoadError>>),
     /// A re-sort finished: the queue in its new order.
     Sorted(Vec<PathBuf>),
+    /// A thumbnail for cells of `px` pixels.
+    Thumb {
+        path: PathBuf,
+        px: u32,
+        result: Result<Thumb, ThumbError>,
+    },
 }
 
 /// Command-line settings that beat the config, across reloads too.
@@ -81,6 +93,20 @@ pub struct Options {
     pub geometry: Option<(u32, u32)>,
     pub class: String,
     pub overrides: Overrides,
+    /// Never write the shared thumbnail cache (`-p`).
+    pub private: bool,
+}
+
+/// Thumbnail jobs for the current cell size.
+#[derive(Default)]
+struct ThumbJobs {
+    /// Cell size the atlas and requests are for (0 = none yet).
+    cell: u32,
+    requested: HashMap<PathBuf, Priority>,
+    /// Paths near the view; the atlas never evicts these.
+    wanted: HashSet<PathBuf>,
+    /// Finished thumbnails waiting for the atlas.
+    arrivals: VecDeque<(PathBuf, Thumb)>,
 }
 
 struct Gfx {
@@ -111,6 +137,12 @@ pub struct App {
     arriving: Arc<Mutex<HashSet<PathBuf>>>,
     gfx: Option<Gfx>,
     uploads: VecDeque<(PathBuf, Arc<DecodedImage>)>,
+    thumbs: ThumbJobs,
+    thumb_cache: CacheOptions,
+    /// When the grid cursor last moved, until the selected image is requested.
+    grid_rest: Option<Instant>,
+    /// The last click in the grid, for double-clicks.
+    last_click: Option<(Instant, usize)>,
     modifiers: ModifiersState,
     cursor: [f32; 2],
     dragging: bool,
@@ -133,6 +165,7 @@ impl App {
         watch: ConfigWatch,
     ) -> Self {
         let cache = ImageCache::new(loaded.config.image.cache_mb << 20);
+        let thumb_cache = CacheOptions::new(loaded.config.grid.thumbnail_cache, opts.private);
         let mut app = Self {
             opts,
             state,
@@ -151,6 +184,10 @@ impl App {
             arriving: Arc::default(),
             gfx: None,
             uploads: VecDeque::new(),
+            thumbs: ThumbJobs::default(),
+            thumb_cache,
+            grid_rest: None,
+            last_click: None,
             modifiers: ModifiersState::empty(),
             cursor: [0.0, 0.0],
             dragging: false,
@@ -224,6 +261,14 @@ impl App {
             self.request_redraw();
             return;
         };
+        if self.state.in_grid() {
+            if navigated || !self.cache_has(&cur) {
+                self.grid_rest = Some(now);
+            }
+            self.sync_thumbs();
+            self.request_redraw();
+            return;
+        }
 
         let keep = |p: &Path| {
             wanted.iter().any(|w| w == p)
@@ -257,6 +302,117 @@ impl App {
             }
         }
         self.request_redraw();
+    }
+
+    fn cache_has(&mut self, path: &Path) -> bool {
+        self.cache.get(path).is_some()
+    }
+
+    /// Request thumbnails around the grid view: visible ones first, then a page above and
+    /// two below. Requests that scrolled out of range are cancelled.
+    fn sync_thumbs(&mut self) {
+        if !self.state.in_grid() {
+            return;
+        }
+        let Some(g) = &mut self.gfx else { return };
+        let px = self.state.cell_px();
+        if px != self.thumbs.cell {
+            for p in self.thumbs.requested.drain().map(|(p, _)| p) {
+                self.pool.cancel(&JobKey::Thumb(p));
+            }
+            self.thumbs.arrivals.clear();
+            self.state.thumbs.clear();
+            g.renderer.reset_thumbs(px);
+            self.thumbs.cell = px;
+        }
+        let l = self.state.grid_layout();
+        let visible = l.visible(self.state.grid.target(&l));
+        let span = l.page_rows() * l.cols;
+        let near = visible.start.saturating_sub(span)..(visible.end + 2 * span).min(l.count);
+        let q = &self.state.queue;
+        let mut wanted = HashSet::with_capacity(near.len());
+        let mut visible_paths = HashSet::with_capacity(visible.len());
+        let mut submit = Vec::new();
+        for i in near {
+            let Some(p) = q.get(i) else { continue };
+            wanted.insert(p.to_path_buf());
+            let prio = if visible.contains(&i) {
+                visible_paths.insert(p.to_path_buf());
+                Priority::ThumbVisible
+            } else {
+                Priority::Thumb
+            };
+            if !self.state.thumbs.contains_key(p) && self.thumbs.requested.get(p) != Some(&prio) {
+                submit.push((p.to_path_buf(), prio));
+            }
+        }
+        // Visible first, in order.
+        submit.sort_by_key(|(_, prio)| *prio);
+        for (p, prio) in submit {
+            self.request_thumb(p.clone(), prio);
+            self.thumbs.requested.insert(p, prio);
+        }
+        let mut demote = Vec::new();
+        self.thumbs.requested.retain(|p, prio| {
+            if !wanted.contains(p) {
+                self.pool.cancel(&JobKey::Thumb(p.clone()));
+                return false;
+            }
+            if *prio == Priority::ThumbVisible && !visible_paths.contains(p) {
+                *prio = Priority::Thumb;
+                demote.push(p.clone());
+            }
+            true
+        });
+        for p in demote {
+            self.request_thumb(p, Priority::Thumb);
+        }
+        self.thumbs.wanted = wanted;
+    }
+
+    fn request_thumb(&self, path: PathBuf, prio: Priority) {
+        let proxy = self.proxy.clone();
+        let cache = self.thumb_cache.clone();
+        let px = self.thumbs.cell;
+        self.pool
+            .submit(JobKey::Thumb(path.clone()), prio, move || {
+                let t = Instant::now();
+                let result = thumbs::load(&path, px, &cache);
+                log::trace!("thumbnail {} in {:.1?}", path.display(), t.elapsed());
+                let _ = proxy.send_event(UserEvent::Thumb { path, px, result });
+            });
+    }
+
+    fn on_thumb(&mut self, path: PathBuf, px: u32, result: Result<Thumb, ThumbError>) {
+        self.thumbs.requested.remove(&path);
+        if px != self.thumbs.cell {
+            return;
+        }
+        match result {
+            Ok(t) => self.thumbs.arrivals.push_back((path, t)),
+            Err(e) => {
+                // Undecodable: it leaves the queue, as in image mode.
+                log::warn!("{}: {e}", path.display());
+                let was_current = self.state.queue.current() == Some(path.as_path());
+                if self.state.queue.remove(&path) {
+                    self.state.skipped += 1;
+                }
+                self.sync(was_current);
+                self.request_redraw();
+            }
+        }
+    }
+
+    /// Every thumbnail on screen is in the atlas.
+    fn grid_settled(&self) -> bool {
+        let l = self.state.grid_layout();
+        let scroll = self.state.grid.scroll(&l, Instant::now());
+        l.visible(scroll).all(|i| {
+            self.state
+                .queue
+                .get(i)
+                .is_some_and(|p| self.state.thumbs.contains_key(p))
+        })
     }
 
     /// Upload `img` in full and put it on screen.
@@ -314,6 +470,12 @@ impl App {
         let mut settings = Settings::from_config(new);
         self.opts.overrides.apply(&mut settings);
         let preload_changed = settings.preload != self.state.settings.preload;
+        if old.grid.size != new.grid.size {
+            self.state.grid.size = new.grid.size;
+        }
+        if old.grid.thumbnail_cache != new.grid.thumbnail_cache {
+            self.thumb_cache = CacheOptions::new(new.grid.thumbnail_cache, self.opts.private);
+        }
         self.state.set_settings(settings);
         self.state.set_theme(loaded.theme, now);
         self.keymap = keymap(&loaded.keys);
@@ -348,6 +510,7 @@ impl App {
         if preload_changed {
             self.sync(false);
         }
+        self.sync_thumbs();
         self.request_redraw();
     }
 
@@ -355,12 +518,15 @@ impl App {
         lock(&self.arriving).remove(&path);
         let now = Instant::now();
         let is_current = self.state.queue.current() == Some(path.as_path());
+        let in_grid = self.state.in_grid();
         match result {
             Ok(img) => {
                 let wanted = self.window_paths();
                 let keep: Vec<&Path> = wanted.iter().map(PathBuf::as_path).collect();
                 self.cache.insert(path.clone(), img.clone(), &keep);
-                if is_current {
+                if in_grid {
+                    // Cached for when the grid opens it.
+                } else if is_current {
                     // Already on screen means this was a reload: replace the texture.
                     let reload = self.state.shown.as_ref().is_some_and(|s| s.path == path);
                     if reload && let Some(g) = &mut self.gfx {
@@ -443,11 +609,16 @@ impl App {
                 let _ = proxy.send_event(UserEvent::Sorted(files));
             });
         }
-        if fx.navigated {
+        if fx.mode {
+            // Opening an image from the grid loads it like navigating to it.
+            self.sync(self.state.mode == Mode::Image || fx.navigated);
+        } else if fx.navigated {
             self.sync(true);
         } else if fx.reordered {
             self.sync(false);
         }
+        // Scrolling, a new size or the bar can bring new thumbnails into view.
+        self.sync_thumbs();
         if fx.redraw || fx.layout {
             self.request_redraw();
         }
@@ -500,7 +671,9 @@ impl App {
         self.repeat = None;
         for run in runs {
             let actions = run.counted();
-            if let [Action::Pan(dir)] = actions[..] {
+            if let [Action::Pan(dir)] = actions[..]
+                && self.state.mode == Mode::Image
+            {
                 if self.state.shown.is_some() {
                     self.held.insert(event.physical_key, dir);
                     self.state.hold_pan(dir, true, now);
@@ -525,14 +698,28 @@ impl App {
         }
     }
 
-    fn on_wheel(&mut self, delta: [f32; 2], event_loop: &ActiveEventLoop) {
+    /// `pixels` is set for touchpads, whose deltas are pixels divided by [`PIXELS_PER_STEP`].
+    fn on_wheel(&mut self, delta: [f32; 2], pixels: bool, event_loop: &ActiveEventLoop) {
         let now = Instant::now();
         let [dx, dy] = delta;
         if dy != 0.0 {
             let dir = if dy > 0.0 { Scroll::Up } else { Scroll::Down };
             let key = input::scroll(dir, self.modifiers);
-            // Wheel zoom stays continuous for touchpads rather than stepping per notch.
+            // Wheel zoom and grid scrolling stay continuous for touchpads rather than stepping
+            // per notch.
+            let in_grid = self.state.in_grid();
             match self.keymap.lookup(self.state.mode, &[key]) {
+                Some([Action::Scroll(d @ (Dir::Up | Dir::Down), n)]) if in_grid => {
+                    let sign = if *d == Dir::Up { -1.0 } else { 1.0 };
+                    let amount = dy.abs() * *n as f32 * sign;
+                    let moved = if pixels {
+                        self.state.grid_drag(-amount * PIXELS_PER_STEP, now)
+                    } else {
+                        self.state.grid_scroll(amount, now)
+                    };
+                    self.after_grid_scroll(moved);
+                    return;
+                }
                 Some([Action::Zoom(Zoom::In(n))]) => {
                     let steps = dy.abs() * *n as f32;
                     self.state.zoom_at(steps, self.cursor, now);
@@ -569,16 +756,49 @@ impl App {
         }
     }
 
+    /// The grid scrolled; `moved` says whether it pulled the cursor along.
+    fn after_grid_scroll(&mut self, moved: bool) {
+        if moved {
+            self.sync(true);
+        } else {
+            self.sync_thumbs();
+        }
+        self.request_redraw();
+    }
+
+    /// A click (press and release in place) in the grid selects; a second one opens.
+    fn grid_click(&mut self, event_loop: &ActiveEventLoop) {
+        let now = Instant::now();
+        let Some(i) = self.state.grid_hit(self.cursor, now) else {
+            return;
+        };
+        let double = self
+            .last_click
+            .is_some_and(|(t, j)| j == i && now < t + DOUBLE_CLICK);
+        self.last_click = (!double).then_some((now, i));
+        let mut actions = vec![Action::Goto(i + 1)];
+        if double {
+            actions.push(Action::Mode(ModeArg::Image));
+        }
+        self.run(actions, None, event_loop);
+    }
+
     fn redraw(&mut self) {
         let now = Instant::now();
         let ready = self.state.shown.is_some()
             || self.state.queue.is_empty()
+            || (self.state.in_grid() && self.grid_settled())
             || now >= self.started + SHOW_TIMEOUT;
         if !self.shown_window && !ready {
             return; // about_to_wait wakes us at the timeout
         }
         self.state.advance(now);
         self.state.tick(now);
+        let settled = if self.state.in_grid() {
+            self.thumbs.arrivals.is_empty() && self.grid_settled()
+        } else {
+            self.state.loading_since.is_none()
+        };
         let Some(g) = &mut self.gfx else { return };
         if !self.shown_window {
             g.window.set_visible(true);
@@ -588,7 +808,7 @@ impl App {
         let result = g.renderer.render(&scene);
         if let Some(path) = std::env::var_os("REMAGE_SNAPSHOT")
             && !self.state.is_animating(now)
-            && self.state.loading_since.is_none()
+            && settled
         {
             match g.renderer.snapshot(&scene, Path::new(&path)) {
                 Ok(()) => log::info!("snapshot written to {}", Path::new(&path).display()),
@@ -614,9 +834,27 @@ impl App {
         }
     }
 
-    /// Upload preloaded images a slice at a time. Returns whether work remains.
+    /// Upload thumbnails, then preloaded images a slice at a time. Returns whether work remains.
     fn pump_uploads(&mut self) -> bool {
         let Some(g) = &mut self.gfx else { return false };
+        let now = Instant::now();
+        let mut bytes = 0;
+        while bytes < UPLOAD_BUDGET
+            && let Some((path, t)) = self.thumbs.arrivals.pop_front()
+        {
+            bytes += t.pixels.len();
+            let wanted = &self.thumbs.wanted;
+            for gone in g.renderer.insert_thumb(&path, &t, |p| wanted.contains(p)) {
+                self.state.thumbs.remove(&gone);
+            }
+            if g.renderer.has_thumb(&path) {
+                self.state.thumb_ready(path, t.size, now);
+            }
+            g.window.request_redraw();
+        }
+        if !self.thumbs.arrivals.is_empty() {
+            return true;
+        }
         if let Some((path, img)) = self.uploads.front() {
             let img = fit_gpu(img.clone(), g.renderer.max_texture_dim());
             if g.renderer.upload(path, &img, UPLOAD_BUDGET) {
@@ -768,6 +1006,7 @@ impl ApplicationHandler<UserEvent> for App {
                 self.state.queue.reorder(files);
                 self.sync(false);
             }
+            UserEvent::Thumb { path, px, result } => self.on_thumb(path, px, result),
         }
     }
 
@@ -780,11 +1019,13 @@ impl ApplicationHandler<UserEvent> for App {
                 let sf = g.window.scale_factor() as f32;
                 self.state
                     .set_window(size.width as f32, size.height as f32, sf);
+                self.sync_thumbs();
                 self.request_redraw();
             }
             WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
                 let [w, h] = self.state.window();
                 self.state.set_window(w, h, scale_factor as f32);
+                self.sync_thumbs();
                 self.request_redraw();
             }
             WindowEvent::RedrawRequested => self.redraw(),
@@ -803,13 +1044,15 @@ impl ApplicationHandler<UserEvent> for App {
             }
             WindowEvent::CursorMoved { position, .. } => {
                 let p = [position.x as f32, position.y as f32];
-                if self.dragging && self.state.shown.is_some() {
-                    self.state
-                        .view
-                        .pan_pixels([p[0] - self.cursor[0], p[1] - self.cursor[1]]);
+                let delta = [p[0] - self.cursor[0], p[1] - self.cursor[1]];
+                self.cursor = p;
+                if self.dragging && self.state.in_grid() {
+                    let moved = self.state.grid_drag(delta[1], Instant::now());
+                    self.after_grid_scroll(moved);
+                } else if self.dragging && self.state.shown.is_some() {
+                    self.state.view.pan_pixels(delta);
                     self.request_redraw();
                 }
-                self.cursor = p;
             }
             WindowEvent::MouseInput { state, button, .. } => {
                 let pressed = state == ElementState::Pressed;
@@ -825,6 +1068,9 @@ impl ApplicationHandler<UserEvent> for App {
                     if moved > CLICK_SLOP * self.state.scale_factor() {
                         return;
                     }
+                    if self.state.in_grid() {
+                        self.grid_click(event_loop);
+                    }
                 } else if !pressed {
                     return;
                 }
@@ -833,13 +1079,14 @@ impl ApplicationHandler<UserEvent> for App {
                 }
             }
             WindowEvent::MouseWheel { delta, .. } => {
-                let d = match delta {
-                    MouseScrollDelta::LineDelta(x, y) => [x, y],
-                    MouseScrollDelta::PixelDelta(p) => {
-                        [p.x as f32 / PIXELS_PER_STEP, p.y as f32 / PIXELS_PER_STEP]
-                    }
+                let (d, pixels) = match delta {
+                    MouseScrollDelta::LineDelta(x, y) => ([x, y], false),
+                    MouseScrollDelta::PixelDelta(p) => (
+                        [p.x as f32 / PIXELS_PER_STEP, p.y as f32 / PIXELS_PER_STEP],
+                        true,
+                    ),
                 };
-                self.on_wheel(d, event_loop);
+                self.on_wheel(d, pixels, event_loop);
             }
             _ => {}
         }
@@ -863,7 +1110,22 @@ impl ApplicationHandler<UserEvent> for App {
                 self.run(run.counted(), None, event_loop);
             }
         }
+        if let Some(t) = self.grid_rest
+            && now >= t + GRID_REST
+        {
+            self.grid_rest = None;
+            if self.state.in_grid()
+                && let Some(cur) = self.state.queue.current().map(Path::to_path_buf)
+                && !self.cache_has(&cur)
+            {
+                self.decode(&cur, Priority::Preload);
+            }
+        }
         let (redraw, mut next) = self.state.tick(now);
+        if let Some(t) = self.grid_rest {
+            let at = t + GRID_REST;
+            next = Some(next.map_or(at, |n| n.min(at)));
+        }
         if let Some(t) = self.ambiguous_since {
             let at = t + SEQUENCE_TIMEOUT;
             next = Some(next.map_or(at, |n| n.min(at)));

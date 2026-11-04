@@ -86,6 +86,11 @@ impl<T: Lerp> Tween<T> {
         }
     }
 
+    /// Where the tween ends up.
+    pub fn target(&self) -> T {
+        self.to
+    }
+
     pub fn is_active(&self, now: Instant) -> bool {
         !self.dur.is_zero() && now < self.start + self.dur
     }

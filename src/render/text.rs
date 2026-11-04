@@ -64,6 +64,8 @@ pub struct TextItem {
     pub y: f32,
     pub align: Align,
     pub max_width: Option<f32>,
+    /// Only the part inside this rect (x, y, w, h) shows.
+    pub clip: Option<[f32; 4]>,
 }
 
 #[derive(Clone, PartialEq, Eq, Hash)]
@@ -261,16 +263,28 @@ impl TextSystem {
             };
             let top = item.y - s.line_height * 0.5;
             let color = item.spans.first().map_or(Rgba([255; 4]), |(_, c)| *c).0;
+            let mut bounds = [left, top, left + width, top + s.line_height];
+            if let Some([x, y, w, h]) = item.clip {
+                bounds = [
+                    bounds[0].max(x),
+                    bounds[1].max(y),
+                    bounds[2].min(x + w),
+                    bounds[3].min(y + h),
+                ];
+                if bounds[2] <= bounds[0] || bounds[3] <= bounds[1] {
+                    return None;
+                }
+            }
             Some(TextArea {
                 buffer: &s.buffer,
                 left,
                 top,
                 scale: 1.0,
                 bounds: TextBounds {
-                    left: left.floor() as i32,
-                    top: top.floor() as i32,
-                    right: (left + width).ceil() as i32,
-                    bottom: (top + s.line_height).ceil() as i32,
+                    left: bounds[0].floor() as i32,
+                    top: bounds[1].floor() as i32,
+                    right: bounds[2].ceil() as i32,
+                    bottom: bounds[3].ceil() as i32,
                 },
                 default_color: Color::rgba(color[0], color[1], color[2], color[3]),
                 custom_glyphs: &[],

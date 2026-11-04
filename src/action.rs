@@ -40,6 +40,15 @@ pub enum Adjust {
     Contrast,
 }
 
+/// Grid paging, like vim's `<C-f>`/`<C-b>` and `<C-d>`/`<C-u>`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Page {
+    Down,
+    Up,
+    HalfDown,
+    HalfUp,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Step {
     Up,
@@ -70,6 +79,13 @@ pub enum Action {
     Pan(Dir),
     PanEdge(Dir),
     Center,
+    /// Grid cursor: cells left/right, rows up/down.
+    Move(Dir, usize),
+    Page(Page),
+    RowStart,
+    RowEnd,
+    /// Scroll the grid by rows (the image view pans a step).
+    Scroll(Dir, usize),
     /// Quarter turns, positive = clockwise.
     Rotate(i32),
     Flip(Axis),
@@ -139,6 +155,15 @@ pub const CATALOG: &[Entry] = &[
     e("pan", "left|right|up|down", "Pan (held keys pan smoothly)"),
     e("pan-edge", "left|right|up|down", "Jump to an edge"),
     e("center", "", "Centre the image"),
+    e("move", "left|right|up|down [n]", "Move the grid cursor"),
+    e("page", "down|up|half-down|half-up", "Page the grid"),
+    e("row-start", "", "First thumbnail in the row"),
+    e("row-end", "", "Last thumbnail in the row"),
+    e(
+        "scroll",
+        "left|right|up|down [n]",
+        "Scroll the grid (pan an image)",
+    ),
     e("rotate", "cw|ccw|180", "Rotate the view"),
     e("flip", "h|v", "Flip the view"),
     e("filter", "toggle", "Toggle nearest/linear filtering"),
@@ -339,6 +364,25 @@ impl FromStr for Action {
             "fit" => Action::Fit(value_enum(name, rest)?),
             "pan" => Action::Pan(dir(name, rest)?),
             "pan-edge" => Action::PanEdge(dir(name, rest)?),
+            "move" | "scroll" => {
+                let (d, n) = rest.split_once(' ').unwrap_or((rest, ""));
+                let (d, n) = (dir(name, d)?, count(name, n.trim())?);
+                if name == "move" {
+                    Action::Move(d, n)
+                } else {
+                    Action::Scroll(d, n)
+                }
+            }
+            "page" => Action::Page(one_of(
+                name,
+                rest,
+                &[
+                    ("down", Page::Down),
+                    ("up", Page::Up),
+                    ("half-down", Page::HalfDown),
+                    ("half-up", Page::HalfUp),
+                ],
+            )?),
             "rotate" => match rest {
                 "cw" => Action::Rotate(1),
                 "ccw" => Action::Rotate(-1),
@@ -415,6 +459,8 @@ impl FromStr for Action {
                     "unmark-all" => Action::UnmarkAll,
                     "invert-marks" => Action::InvertMarks,
                     "center" | "centre" => Action::Center,
+                    "row-start" => Action::RowStart,
+                    "row-end" => Action::RowEnd,
                     "visual" => Action::Visual,
                     "help" => Action::Help,
                     "palette" => Action::Palette,
@@ -461,6 +507,15 @@ fn dir_name(d: Dir) -> &'static str {
     }
 }
 
+fn page_name(p: Page) -> &'static str {
+    match p {
+        Page::Down => "down",
+        Page::Up => "up",
+        Page::HalfDown => "half-down",
+        Page::HalfUp => "half-up",
+    }
+}
+
 fn step_name(s: Step) -> &'static str {
     match s {
         Step::Up => "+",
@@ -489,6 +544,9 @@ impl fmt::Display for Action {
             Action::Zoom(Zoom::Percent(p)) => write!(f, "zoom {p}%"),
             Action::Fit(m) => write!(f, "fit {}", value_name(m)),
             Action::Pan(d) | Action::PanEdge(d) => write!(f, "{n} {}", dir_name(*d)),
+            Action::Move(d, 1) | Action::Scroll(d, 1) => write!(f, "{n} {}", dir_name(*d)),
+            Action::Move(d, c) | Action::Scroll(d, c) => write!(f, "{n} {} {c}", dir_name(*d)),
+            Action::Page(p) => write!(f, "page {}", page_name(*p)),
             Action::Rotate(1) => f.write_str("rotate cw"),
             Action::Rotate(-1) => f.write_str("rotate ccw"),
             Action::Rotate(q) => write!(f, "rotate {}", q * 90),
@@ -548,6 +606,11 @@ impl Action {
             Action::Pan(_) => "pan",
             Action::PanEdge(_) => "pan-edge",
             Action::Center => "center",
+            Action::Move(..) => "move",
+            Action::Page(_) => "page",
+            Action::RowStart => "row-start",
+            Action::RowEnd => "row-end",
+            Action::Scroll(..) => "scroll",
             Action::Rotate(_) => "rotate",
             Action::Flip(_) => "flip",
             Action::FilterToggle => "filter",
@@ -614,6 +677,14 @@ impl Action {
             },
             Action::Pan(d) => format!("Pan {}", dir_name(*d)),
             Action::PanEdge(d) => format!("Jump to {} edge", dir_name(*d)),
+            Action::Move(d, _) => format!("Move {}", dir_name(*d)),
+            Action::Scroll(d, _) => format!("Scroll {}", dir_name(*d)),
+            Action::Page(p) => match p {
+                Page::Down => "Page down".into(),
+                Page::Up => "Page up".into(),
+                Page::HalfDown => "Half a page down".into(),
+                Page::HalfUp => "Half a page up".into(),
+            },
             Action::Rotate(1) => "Rotate clockwise".into(),
             Action::Rotate(-1) => "Rotate counter-clockwise".into(),
             Action::Rotate(q) => format!("Rotate {}°", q * 90),
@@ -678,6 +749,8 @@ impl Action {
                 Action::Rotate(total.signum() * ((total.abs() - 1) % 4 + 1))
             }
             Action::GridSize(d) => Action::GridSize(d.saturating_mul(n32)),
+            Action::Move(d, k) => Action::Move(d, k.saturating_mul(n)),
+            Action::Scroll(d, k) => Action::Scroll(d, k.saturating_mul(n)),
             other => other,
         }
     }
@@ -694,6 +767,9 @@ impl Action {
                 | Action::PrevFrame
                 | Action::Zoom(Zoom::In(_) | Zoom::Out(_))
                 | Action::GridSize(_)
+                | Action::Move(..)
+                | Action::Scroll(..)
+                | Action::Page(_)
                 | Action::Adjust(_, Step::Up | Step::Down)
         )
     }
@@ -786,6 +862,14 @@ mod tests {
             "pan left",
             "pan-edge down",
             "center",
+            "move left",
+            "move down 3",
+            "page half-down",
+            "page up",
+            "row-start",
+            "row-end",
+            "scroll up",
+            "scroll down 2",
             "rotate cw",
             "rotate ccw",
             "rotate 180",
@@ -853,6 +937,10 @@ mod tests {
             Action::Zoom(Zoom::In(3))
         );
         assert_eq!(Action::GridSize(-1).with_count(2), Action::GridSize(-2));
+        assert_eq!(
+            Action::Move(Dir::Down, 1).with_count(5),
+            Action::Move(Dir::Down, 5)
+        );
         assert_eq!(Action::Quit.with_count(4), Action::Quit);
     }
 }

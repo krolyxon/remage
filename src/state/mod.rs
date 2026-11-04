@@ -4,13 +4,15 @@ pub mod grid;
 pub mod queue;
 pub mod view;
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use crate::action::{Action, ModeArg, Switch, Zoom};
+use crate::action::{Action, ModeArg, Page, Switch, Zoom};
 use crate::anim::Tween;
 use crate::config::theme::Theme;
 use crate::config::{Config, Transition};
+use grid::{Grid, Layout};
 use queue::{Queue, SortKey};
 use view::{Affine, Dir, FitMode, View};
 
@@ -26,9 +28,12 @@ pub const BAR_HEIGHT: f32 = 32.0;
 const CROSSFADE: Duration = Duration::from_millis(100);
 /// Theme changes (a new wallpaper palette) crossfade this long.
 const THEME_FADE: Duration = Duration::from_millis(250);
+/// Thumbnails fade in this long as they arrive.
+const THUMB_FADE: Duration = Duration::from_millis(150);
+/// Thumbnail names: Space Grotesk at this size.
+pub const GRID_NAME_SIZE: f32 = 12.0;
 
-/// Which keymap applies, and (from M3) what is on screen.
-#[allow(dead_code)] // grid and visual arrive in M3
+/// Which keymap applies and what is on screen.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Mode {
     #[default]
@@ -50,6 +55,12 @@ pub struct Settings {
     /// UI size multiplier on top of the display scale.
     pub ui_scale: f32,
     pub which_key_delay: Duration,
+    pub thumb_fade: Duration,
+    /// Logical thumbnail sizes `grid-size` steps through, and the starting one.
+    pub grid_sizes: Vec<u32>,
+    pub grid_size: u32,
+    pub grid_gap: u32,
+    pub grid_names: bool,
 }
 
 impl Default for Settings {
@@ -65,6 +76,11 @@ impl Default for Settings {
             theme_fade: THEME_FADE,
             ui_scale: 1.0,
             which_key_delay: Duration::from_millis(300),
+            thumb_fade: THUMB_FADE,
+            grid_sizes: vec![96, 128, 160, 224, 320],
+            grid_size: 160,
+            grid_gap: 16,
+            grid_names: false,
         }
     }
 }
@@ -87,6 +103,11 @@ impl Settings {
             theme_fade: anim(THEME_FADE),
             ui_scale: c.ui.scale,
             which_key_delay: Duration::from_millis(c.ui.which_key_delay_ms),
+            thumb_fade: anim(THUMB_FADE),
+            grid_sizes: c.grid.sizes.clone(),
+            grid_size: c.grid.size,
+            grid_gap: c.grid.gap,
+            grid_names: c.grid.names,
         }
     }
 }
@@ -140,6 +161,14 @@ pub struct Fade {
     pub alpha: Tween<f32>,
 }
 
+/// A thumbnail in the atlas, as far as drawing it is concerned.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ThumbState {
+    pub size: [u32; 2],
+    /// When it arrived, for the fade-in.
+    pub at: Instant,
+}
+
 #[derive(Clone, Copy, Debug)]
 struct Hold {
     dir: Dir,
@@ -157,6 +186,8 @@ pub struct Effects {
     pub reordered: bool,
     /// The status bar appeared or vanished, so the image area changed.
     pub layout: bool,
+    /// Image ⇄ grid (or visual) switched.
+    pub mode: bool,
     pub fullscreen: Option<Switch>,
     pub reload: bool,
     pub reload_config: bool,
@@ -171,6 +202,10 @@ pub struct AppState {
     pub view: View,
     pub settings: Settings,
     pub mode: Mode,
+    pub grid: Grid,
+    /// Thumbnails in the atlas (or known to fail), by path.
+    pub thumbs: HashMap<PathBuf, ThumbState>,
+    last_thumb: Option<Instant>,
     pub theme: Theme,
     /// The previous theme fading out after a reload.
     theme_fade: Option<(Theme, Tween<f32>)>,
@@ -196,6 +231,9 @@ impl AppState {
         Self {
             queue,
             view: View::new(now),
+            grid: Grid::new(settings.grid_size, now),
+            thumbs: HashMap::new(),
+            last_thumb: None,
             settings,
             mode: Mode::Image,
             theme: Theme::nothing_dark(),
@@ -221,6 +259,9 @@ impl AppState {
         self.window = [w, h];
         self.scale_factor = scale_factor;
         self.update_viewport();
+        if self.in_grid() {
+            self.grid_follow(Instant::now(), false);
+        }
     }
 
     pub fn window(&self) -> [f32; 2] {
@@ -243,6 +284,121 @@ impl AppState {
         } else {
             0.0
         }
+    }
+
+    pub fn in_grid(&self) -> bool {
+        matches!(self.mode, Mode::Grid | Mode::Visual)
+    }
+
+    /// Side of a thumbnail cell in physical pixels.
+    pub fn cell_px(&self) -> u32 {
+        (self.grid.size as f32 * self.ui_scale()).round().max(16.0) as u32
+    }
+
+    /// This frame's grid geometry.
+    pub fn grid_layout(&self) -> Layout {
+        let sf = self.ui_scale();
+        let label = if self.settings.grid_names {
+            ((GRID_NAME_SIZE * 1.25).ceil() + 8.0) * sf
+        } else {
+            0.0
+        };
+        Layout::new(
+            self.queue.len(),
+            [
+                self.window[0],
+                (self.window[1] - self.bar_height()).max(1.0),
+            ],
+            self.cell_px() as f32,
+            (self.settings.grid_gap as f32 * sf).round(),
+            label.round(),
+        )
+    }
+
+    /// Scroll so the cursor's row is on screen.
+    fn grid_follow(&mut self, now: Instant, animate: bool) {
+        let l = self.grid_layout();
+        let to = l.follow(self.queue.index(), self.grid.target(&l));
+        if animate {
+            self.grid.scroll_to(to, now, self.settings.anim);
+        } else {
+            self.grid.jump_to(to);
+        }
+    }
+
+    /// Scroll the grid by `rows` (fractional for touchpads), pulling the cursor along so it
+    /// stays on screen. Returns whether the cursor moved.
+    pub fn grid_scroll(&mut self, rows: f32, now: Instant) -> bool {
+        let l = self.grid_layout();
+        let to = l.clamp_scroll(self.grid.target(&l) + rows * l.row_height());
+        self.grid.scroll_to(to, now, self.settings.anim);
+        self.queue.goto(l.pull_into_view(self.queue.index(), to))
+    }
+
+    /// Drag the grid content by `dy` pixels. Returns whether the cursor moved.
+    pub fn grid_drag(&mut self, dy: f32, now: Instant) -> bool {
+        let l = self.grid_layout();
+        let to = l.clamp_scroll(self.grid.scroll(&l, now) - dy);
+        self.grid.jump_to(to);
+        self.queue.goto(l.pull_into_view(self.queue.index(), to))
+    }
+
+    /// The thumbnail under a window point.
+    pub fn grid_hit(&self, p: [f32; 2], now: Instant) -> Option<usize> {
+        let l = self.grid_layout();
+        if p[1] >= l.viewport[1] {
+            return None;
+        }
+        l.hit(p, self.grid.scroll(&l, now))
+    }
+
+    /// The selected range in visual mode.
+    pub fn visual_range(&self) -> Option<std::ops::Range<usize>> {
+        if self.mode != Mode::Visual {
+            return None;
+        }
+        let r = self.grid.range(self.queue.index())?;
+        Some(r.start.min(self.queue.len())..r.end.min(self.queue.len()))
+    }
+
+    /// Switch modes. Returns whether the mode changed.
+    pub fn set_mode(&mut self, mode: Mode, now: Instant) -> bool {
+        if mode == self.mode {
+            return false;
+        }
+        let was_grid = self.in_grid();
+        self.mode = mode;
+        if mode != Mode::Visual {
+            self.grid.anchor = None;
+        }
+        self.holds.clear();
+        match mode {
+            Mode::Image => {
+                // Don't crossfade from whatever was open before the grid.
+                if self.shown.as_ref().map(|s| s.path.as_path()) != self.queue.current() {
+                    self.clear_shown();
+                }
+            }
+            Mode::Grid | Mode::Visual if !was_grid => self.grid_follow(now, false),
+            _ => {}
+        }
+        true
+    }
+
+    /// A thumbnail landed in the atlas.
+    pub fn thumb_ready(&mut self, path: PathBuf, size: [u32; 2], now: Instant) {
+        self.thumbs.insert(path, ThumbState { size, at: now });
+        self.last_thumb = Some(now);
+    }
+
+    /// Opacity of a thumbnail fading in.
+    pub fn thumb_alpha(&self, at: Instant, now: Instant) -> f32 {
+        let d = self.settings.thumb_fade;
+        if d.is_zero() {
+            return 1.0;
+        }
+        let t = now.saturating_duration_since(at).as_secs_f32() / d.as_secs_f32();
+        crate::anim::ease(t.min(1.0))
     }
 
     fn update_viewport(&mut self) {
@@ -295,7 +451,9 @@ impl AppState {
             ..Effects::default()
         };
         let dur = self.dur();
-        let has_image = self.shown.is_some();
+        let in_grid = self.in_grid();
+        let has_image = self.mode == Mode::Image && self.shown.is_some();
+        let wrap = self.settings.wrap;
         let switch = |s: Switch, cur: bool| match s {
             Switch::Toggle => !cur,
             Switch::On => true,
@@ -327,6 +485,100 @@ impl AppState {
                     Zoom::Percent(p) => self.view.zoom_to(p / 100.0, anchor, now, dur),
                 }
             }
+            Action::NextMark | Action::PrevMark => {
+                let forward = action == Action::NextMark;
+                match self.queue.find_mark(forward, 1, wrap) {
+                    Some(i) => fx.navigated = self.queue.goto(i),
+                    None => self.notify("no other marks", MsgKind::Info, now),
+                }
+            }
+            Action::Mark(s) => {
+                if let Some(range) = self.visual_range() {
+                    let on = match s {
+                        Switch::Toggle => !range.clone().all(|i| self.queue.is_marked(i)),
+                        Switch::On => true,
+                        Switch::Off => false,
+                    };
+                    for i in range {
+                        self.queue.set_mark(i, on);
+                    }
+                    fx.mode = self.set_mode(Mode::Grid, now);
+                } else {
+                    let i = self.queue.index();
+                    let cur = self.queue.is_marked(i);
+                    self.queue.set_mark(i, switch(s, cur));
+                }
+            }
+            Action::MarkAll => self.queue.mark_all(),
+            Action::UnmarkAll => self.queue.unmark_all(),
+            Action::InvertMarks => self.queue.invert_marks(),
+            Action::Move(dir, n) if in_grid => {
+                let l = self.grid_layout();
+                fx.navigated = self.queue.goto(l.step(self.queue.index(), dir, n));
+            }
+            Action::Page(page) if in_grid => {
+                let l = self.grid_layout();
+                let full = l.page_rows() as isize;
+                let half = ((l.viewport[1] / l.row_height() / 2.0).round() as isize).max(1);
+                let rows = match page {
+                    Page::Down => full,
+                    Page::Up => -full,
+                    Page::HalfDown => half,
+                    Page::HalfUp => -half,
+                };
+                let to = l.clamp_scroll(self.grid.target(&l) + rows as f32 * l.row_height());
+                self.grid.scroll_to(to, now, dur);
+                fx.navigated = self.queue.goto(l.step_rows(self.queue.index(), rows));
+            }
+            Action::RowStart | Action::RowEnd if in_grid => {
+                let l = self.grid_layout();
+                let i = self.queue.index();
+                let to = if action == Action::RowStart {
+                    l.row_start(i)
+                } else {
+                    l.row_end(i)
+                };
+                fx.navigated = self.queue.goto(to);
+            }
+            Action::Scroll(dir, n) if in_grid => match dir {
+                Dir::Up => fx.navigated = self.grid_scroll(-(n as f32), now),
+                Dir::Down => fx.navigated = self.grid_scroll(n as f32, now),
+                Dir::Left | Dir::Right => fx.redraw = false,
+            },
+            Action::Scroll(dir, n) if has_image => {
+                self.view.pan_step(dir, 0.1 * n as f32, now, dur);
+            }
+            Action::Mode(m) => {
+                let target = match m {
+                    ModeArg::Image => Mode::Image,
+                    ModeArg::Grid => Mode::Grid,
+                    ModeArg::Toggle if in_grid => Mode::Image,
+                    ModeArg::Toggle => Mode::Grid,
+                };
+                fx.mode = self.set_mode(target, now);
+                fx.redraw = fx.mode;
+            }
+            Action::Visual => {
+                if self.mode == Mode::Visual {
+                    fx.mode = self.set_mode(Mode::Grid, now);
+                } else {
+                    self.set_mode(Mode::Grid, now);
+                    self.grid.anchor = Some(self.queue.index());
+                    self.mode = Mode::Visual;
+                    fx.mode = true;
+                }
+            }
+            Action::GridSize(d) => {
+                let size = grid::next_size(&self.settings.grid_sizes, self.grid.size, d);
+                if size == self.grid.size {
+                    fx.redraw = false;
+                } else {
+                    self.grid.size = size;
+                    if in_grid {
+                        self.grid_follow(now, false);
+                    }
+                }
+            }
             Action::Fit(fit) if has_image => self.view.set_fit(fit, now, dur),
             Action::Pan(dir) if has_image => self.view.pan_step(dir, 0.2, now, dur),
             Action::PanEdge(dir) if has_image => self.view.pan_edge(dir, now, dur),
@@ -352,7 +604,6 @@ impl AppState {
                     fx.layout = true;
                 }
             }
-            Action::Mode(ModeArg::Image) if self.mode == Mode::Image => fx.redraw = false,
             Action::Sort(key) => fx.sort = Some(key),
             Action::Reverse => {
                 self.queue.reverse();
@@ -375,27 +626,23 @@ impl AppState {
             | Action::PanEdge(_)
             | Action::Center
             | Action::Rotate(_)
-            | Action::Flip(_) => fx.redraw = false,
+            | Action::Flip(_)
+            | Action::Move(..)
+            | Action::Page(_)
+            | Action::RowStart
+            | Action::RowEnd
+            | Action::Scroll(..) => fx.redraw = false,
             // Parsed and bindable now; they arrive with later milestones.
-            other @ (Action::NextMark
-            | Action::PrevMark
-            | Action::NextFrame
+            other @ (Action::NextFrame
             | Action::PrevFrame
-            | Action::Mark(_)
-            | Action::MarkAll
-            | Action::UnmarkAll
-            | Action::InvertMarks
             | Action::Adjust(..)
             | Action::Play(_)
             | Action::Slideshow(_)
             | Action::SlideshowDelay { .. }
-            | Action::Mode(_)
-            | Action::Visual
             | Action::Info(_)
             | Action::Help
             | Action::Palette
             | Action::Search
-            | Action::GridSize(_)
             | Action::Filter(_)
             | Action::FilterClear
             | Action::Refresh
@@ -407,6 +654,9 @@ impl AppState {
                     now,
                 );
             }
+        }
+        if fx.navigated && self.in_grid() {
+            self.grid_follow(now, true);
         }
         fx
     }
@@ -538,7 +788,12 @@ impl AppState {
 
     /// Whether frames must keep coming (animations, held keys).
     pub fn is_animating(&self, now: Instant) -> bool {
-        self.view.is_animating(now)
+        let grid = self.in_grid()
+            && (self.grid.is_animating(now)
+                || self
+                    .last_thumb
+                    .is_some_and(|t| now < t + self.settings.thumb_fade));
+        grid || self.view.is_animating(now)
             || self.fade.as_ref().is_some_and(|f| f.alpha.is_active(now))
             || self
                 .theme_fade
@@ -668,6 +923,76 @@ mod tests {
         assert_eq!(s.message.as_ref().map(|m| m.text.as_str()), Some("hi"));
         assert!(s.apply(Action::Random, now).navigated);
         assert_eq!(s.queue.index(), 1);
+    }
+
+    #[test]
+    fn grid_mode_moves_the_queue_cursor() {
+        let (mut s, now) = state(40);
+        assert!(s.apply(Action::Mode(ModeArg::Toggle), now).mode);
+        assert_eq!(s.mode, Mode::Grid);
+        // 800 wide, 160 cells, 16 gaps: 4 columns.
+        assert_eq!(s.grid_layout().cols, 4);
+        assert!(s.apply(Action::Move(Dir::Down, 2), now).navigated);
+        assert_eq!(s.queue.index(), 8);
+        s.apply(Action::RowEnd, now);
+        assert_eq!(s.queue.index(), 11);
+        s.apply(Action::Last, now);
+        let l = s.grid_layout();
+        assert_eq!(s.grid.target(&l), l.max_scroll());
+        s.apply(Action::Page(Page::Up), now);
+        assert_eq!(s.queue.index(), 39 - 4 * l.page_rows());
+        // Image-only actions do nothing in the grid.
+        assert!(!s.apply(Action::Zoom(Zoom::In(1)), now).redraw);
+        assert!(s.apply(Action::Mode(ModeArg::Toggle), now).mode);
+        assert_eq!(s.mode, Mode::Image);
+        assert!(!s.apply(Action::Move(Dir::Down, 1), now).redraw);
+    }
+
+    #[test]
+    fn visual_mode_marks_a_range() {
+        let (mut s, now) = state(10);
+        s.apply(Action::Goto(2), now);
+        s.apply(Action::Visual, now);
+        assert_eq!(s.mode, Mode::Visual);
+        s.apply(Action::Move(Dir::Right, 3), now);
+        assert_eq!(s.visual_range(), Some(1..5));
+        s.apply(Action::Mark(Switch::On), now);
+        assert_eq!(s.mode, Mode::Grid);
+        assert_eq!(s.queue.marked_count(), 4);
+        // Toggling a fully marked range unmarks it.
+        s.apply(Action::Visual, now);
+        s.apply(Action::Move(Dir::Left, 3), now);
+        s.apply(Action::Mark(Switch::Toggle), now);
+        assert_eq!(s.queue.marked_count(), 0);
+    }
+
+    #[test]
+    fn marks_and_mark_navigation() {
+        let (mut s, now) = state(5);
+        s.apply(Action::Mark(Switch::Toggle), now);
+        s.apply(Action::Goto(4), now);
+        s.apply(Action::Mark(Switch::Toggle), now);
+        assert_eq!(s.queue.marked_count(), 2);
+        assert!(s.apply(Action::NextMark, now).navigated);
+        assert_eq!(s.queue.index(), 0);
+        s.apply(Action::InvertMarks, now);
+        assert_eq!(s.queue.marked_count(), 3);
+        s.apply(Action::UnmarkAll, now);
+        assert!(!s.apply(Action::NextMark, now).navigated);
+        assert!(s.message.is_some());
+        s.apply(Action::MarkAll, now);
+        assert_eq!(s.queue.marked_count(), 5);
+    }
+
+    #[test]
+    fn grid_size_steps_through_sizes() {
+        let (mut s, now) = state(3);
+        s.apply(Action::GridSize(1), now);
+        assert_eq!(s.grid.size, 224);
+        s.apply(Action::GridSize(5), now);
+        assert_eq!(s.grid.size, 320);
+        assert!(!s.apply(Action::GridSize(1), now).redraw);
+        assert_eq!(s.cell_px(), 320);
     }
 
     #[test]

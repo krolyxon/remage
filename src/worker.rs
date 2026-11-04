@@ -17,10 +17,8 @@ pub enum Priority {
     /// Neighbours of the current image.
     Preload = 1,
     /// Thumbnails in view.
-    #[allow(dead_code)] // thumbnails arrive in M3
     ThumbVisible = 2,
     /// Other thumbnails.
-    #[allow(dead_code)]
     Thumb = 3,
 }
 
@@ -33,6 +31,7 @@ impl Priority {
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum JobKey {
     Decode(PathBuf),
+    Thumb(PathBuf),
 }
 
 type Work = Box<dyn FnOnce() + Send>;
@@ -161,6 +160,11 @@ impl Pool {
         self.shared.cv.notify_one();
     }
 
+    /// Drop `key` if it is still queued (a running job finishes regardless).
+    pub fn cancel(&self, key: &JobKey) {
+        self.shared.lock().live.remove(key);
+    }
+
     /// Invalidate every queued current/preload job.
     pub fn bump_epoch(&self) {
         self.shared.lock().epoch += 1;
@@ -251,6 +255,26 @@ mod tests {
         }
         gate_tx.send(()).unwrap();
         assert_eq!(rx.recv_timeout(Duration::from_secs(2)).unwrap(), "new");
+        assert!(rx.recv_timeout(Duration::from_millis(100)).is_err());
+    }
+
+    #[test]
+    fn cancelled_jobs_never_run() {
+        let pool = Pool::with_threads(1);
+        let (gate_tx, gate_rx) = unbounded::<()>();
+        let (tx, rx) = unbounded();
+        pool.submit(key("gate"), Priority::Current, move || {
+            let _ = gate_rx.recv();
+        });
+        std::thread::sleep(Duration::from_millis(50));
+        for k in ["a", "b"] {
+            let tx = tx.clone();
+            let job = JobKey::Thumb(PathBuf::from(k));
+            pool.submit(job, Priority::Thumb, move || tx.send(k).unwrap());
+        }
+        pool.cancel(&JobKey::Thumb(PathBuf::from("a")));
+        gate_tx.send(()).unwrap();
+        assert_eq!(rx.recv_timeout(Duration::from_secs(2)).unwrap(), "b");
         assert!(rx.recv_timeout(Duration::from_millis(100)).is_err());
     }
 }

@@ -23,6 +23,35 @@ impl Prim {
             params: [0.0; 4],
         }
     }
+
+    pub fn rounded(rect: [f32; 4], color: [f32; 4], radius: f32) -> Self {
+        Self {
+            params: [radius, 0.0, 0.0, 0.0],
+            ..Self::rect(rect, color)
+        }
+    }
+
+    /// An outline only.
+    pub fn outline(rect: [f32; 4], color: [f32; 4], radius: f32, width: f32) -> Self {
+        Self {
+            rect,
+            color: [0.0; 4],
+            border_color: color,
+            params: [radius, width, 0.0, 0.0],
+        }
+    }
+
+    /// A dot centred on `c`, optionally ringed.
+    pub fn dot(c: [f32; 2], r: f32, color: [f32; 4], ring: Option<([f32; 4], f32)>) -> Self {
+        let (border_color, w) = ring.unwrap_or(([0.0; 4], 0.0));
+        let r = r + w;
+        Self {
+            rect: [c[0] - r, c[1] - r, 2.0 * r, 2.0 * r],
+            color,
+            border_color,
+            params: [r, w, 0.0, 0.0],
+        }
+    }
 }
 
 pub struct PrimPipeline {
@@ -31,6 +60,8 @@ pub struct PrimPipeline {
     bind_group: wgpu::BindGroup,
     instances: wgpu::Buffer,
     capacity: usize,
+    /// Instances of the under layer, then the over layer.
+    split: u32,
     count: u32,
 }
 
@@ -116,17 +147,21 @@ impl PrimPipeline {
             bind_group,
             instances: instance_buffer(device, capacity),
             capacity,
+            split: 0,
             count: 0,
         }
     }
 
+    /// Upload both layers: `under` draws before images and thumbnails, `over` after.
     pub fn prepare(
         &mut self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
-        prims: &[Prim],
+        under: &[Prim],
+        over: &[Prim],
         viewport: [f32; 2],
     ) {
+        let prims: Vec<Prim> = under.iter().chain(over).copied().collect();
         queue.write_buffer(
             &self.globals,
             0,
@@ -137,18 +172,27 @@ impl PrimPipeline {
             self.instances = instance_buffer(device, self.capacity);
         }
         if !prims.is_empty() {
-            queue.write_buffer(&self.instances, 0, bytemuck::cast_slice(prims));
+            queue.write_buffer(&self.instances, 0, bytemuck::cast_slice(&prims));
         }
+        self.split = under.len() as u32;
         self.count = prims.len() as u32;
     }
 
-    pub fn draw(&self, pass: &mut wgpu::RenderPass<'_>) {
-        if self.count == 0 {
+    fn draw_range(&self, pass: &mut wgpu::RenderPass<'_>, range: std::ops::Range<u32>) {
+        if range.is_empty() {
             return;
         }
         pass.set_pipeline(&self.pipeline);
         pass.set_bind_group(0, &self.bind_group, &[]);
         pass.set_vertex_buffer(0, self.instances.slice(..));
-        pass.draw(0..6, 0..self.count);
+        pass.draw(0..6, range);
+    }
+
+    pub fn draw_under(&self, pass: &mut wgpu::RenderPass<'_>) {
+        self.draw_range(pass, 0..self.split);
+    }
+
+    pub fn draw_over(&self, pass: &mut wgpu::RenderPass<'_>) {
+        self.draw_range(pass, self.split..self.count);
     }
 }

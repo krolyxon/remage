@@ -41,8 +41,8 @@ and must stay mutually compatible.
 | Errors / logs | `anyhow`, `thiserror`, `log` + `env_logger` (`RUST_LOG=remage=debug`) |
 
 **Locked pairings (M0, 2026-11):** glyphon 0.12 ↔ wgpu 30 (cosmic-text 0.19). winit stays on
-0.30 until 0.31 leaves beta. Bump glyphon and wgpu together, never one alone. Crates still to add
-when their milestone needs them: `jpeg-decoder` (M3 scaled thumbnails) and `clap_mangen` (M7).
+0.30 until 0.31 leaves beta. Bump glyphon and wgpu together, never one alone. Crate still to add
+when its milestone needs it: `clap_mangen` (M7).
 
 Cargo features are `default = ["jxl", "svg", "avif", "heif", "raw"]`. The only C dependencies
 (dav1d, libheif) sit behind `avif` and `heif`.
@@ -211,6 +211,7 @@ action carries a one-line description, which feeds the palette, which-key and he
 |---|---|
 | Navigation | `next [n]`, `prev [n]`, `first`, `last`, `goto N`, `random`, `next-mark`, `prev-mark`, `next-frame`, `prev-frame` |
 | Marks | `mark [toggle\|on\|off]`, `mark-all`, `unmark-all`, `invert-marks` |
+| Grid | `move <dir> [n]`, `page down\|up\|half-down\|half-up`, `row-start`, `row-end`, `scroll <dir> [n]` (pans a step in image mode) |
 | View | `zoom in\|out\|N%`, `fit <mode>`, `pan <dir>`, `pan-edge <dir>`, `center`, `rotate cw\|ccw\|180`, `flip h\|v`, `filter toggle`, `alpha-bg cycle`, `gamma\|brightness\|contrast +\|-\|reset` |
 | Playback | `play toggle`, `slideshow toggle`, `slideshow-delay ±N` |
 | UI | `mode image\|grid\|toggle`, `visual`, `fullscreen`, `bar toggle`, `info toggle`, `help`, `palette`, `search`, `grid-size +\|-` |
@@ -434,7 +435,7 @@ Each milestone should end with a usable binary.
   - Action grammar, and a keymap trie with sequences, counts and mouse bindings.
   - TOML defaults, include and live reload, plus `--dump-config` and `--check-config`.
   - Theme tokens, presets and derivation; matugen + pywal support.
-- **M3 Grid + marks**
+- **M3 Grid + marks** ✓ (2026-11-04). Cached grid opens in ~85 ms, 0% CPU when idle.
   - Freedesktop thumbnails, worker priorities and the GPU atlas.
   - Grid navigation, visual mode, marks and smooth scrolling.
 - **M4 Commands + IPC**

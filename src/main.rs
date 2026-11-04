@@ -82,6 +82,9 @@ fn main() -> anyhow::Result<()> {
     let queue = Queue::new(scan.files, scan.start.as_deref(), start_index);
     let bar = overrides.bar.unwrap_or(cfg.ui.statusbar);
     let mut state = AppState::new(queue, settings, bar, Instant::now());
+    if cli.grid || cfg.general.start_mode == config::StartMode::Grid {
+        state.set_mode(state::Mode::Grid, Instant::now());
+    }
     state.theme = loaded.theme.clone();
     state.nearest = cfg.image.filter.nearest();
     state.alpha_bg = cfg.image.alpha_background;
@@ -113,6 +116,7 @@ fn main() -> anyhow::Result<()> {
         geometry: cli.geometry,
         class: cli.class.unwrap_or_else(|| cfg.window.class.clone()),
         overrides,
+        private: cli.private,
     };
     let mut app = App::new(opts, state, proxy, loaded, watch);
     if let Some(e) = config_error {

@@ -29,6 +29,8 @@ pub enum SortKey {
 pub struct Queue {
     files: Vec<PathBuf>,
     index: usize,
+    /// Marked files, by path so reordering keeps them.
+    marks: HashSet<PathBuf>,
 }
 
 impl Queue {
@@ -37,7 +39,11 @@ impl Queue {
         let index = start
             .and_then(|s| files.iter().position(|f| f == s))
             .unwrap_or(start_index);
-        let mut q = Self { files, index: 0 };
+        let mut q = Self {
+            files,
+            index: 0,
+            marks: HashSet::new(),
+        };
         q.index = q.clamp(index);
         q
     }
@@ -90,7 +96,8 @@ impl Queue {
         let Some(i) = self.files.iter().position(|f| f == path) else {
             return false;
         };
-        self.files.remove(i);
+        let removed = self.files.remove(i);
+        self.marks.remove(&removed);
         if i < self.index {
             self.index -= 1;
         }
@@ -169,6 +176,85 @@ impl Queue {
         {
             self.index = i;
         }
+    }
+
+    pub fn is_marked(&self, i: usize) -> bool {
+        self.files.get(i).is_some_and(|f| self.marks.contains(f))
+    }
+
+    pub fn marked_count(&self) -> usize {
+        self.marks.len()
+    }
+
+    /// Mark or unmark file `i`. Returns whether anything changed.
+    pub fn set_mark(&mut self, i: usize, on: bool) -> bool {
+        let Some(f) = self.files.get(i) else {
+            return false;
+        };
+        if on {
+            self.marks.insert(f.clone())
+        } else {
+            self.marks.remove(f)
+        }
+    }
+
+    pub fn mark_all(&mut self) {
+        self.marks = self.files.iter().cloned().collect();
+    }
+
+    pub fn unmark_all(&mut self) {
+        self.marks.clear();
+    }
+
+    pub fn invert_marks(&mut self) {
+        self.marks = self
+            .files
+            .iter()
+            .filter(|f| !self.marks.contains(*f))
+            .cloned()
+            .collect();
+    }
+
+    /// Marked files in queue order.
+    #[allow(dead_code)] // `-o` and command targets arrive in M4
+    pub fn marked(&self) -> Vec<&Path> {
+        self.files
+            .iter()
+            .filter(|f| self.marks.contains(*f))
+            .map(PathBuf::as_path)
+            .collect()
+    }
+
+    /// The `n`th marked file after (`forward`) or before the current one.
+    pub fn find_mark(&self, forward: bool, n: usize, wrap: bool) -> Option<usize> {
+        let len = self.files.len();
+        if self.marks.is_empty() || len == 0 {
+            return None;
+        }
+        let mut found = None;
+        let mut left = n.max(1);
+        for k in 1..len {
+            let i = if forward {
+                let i = self.index + k;
+                if i >= len && !wrap {
+                    break;
+                }
+                i % len
+            } else {
+                if k > self.index && !wrap {
+                    break;
+                }
+                (self.index + len - k) % len
+            };
+            if self.is_marked(i) {
+                found = Some(i);
+                left -= 1;
+                if left == 0 {
+                    break;
+                }
+            }
+        }
+        found
     }
 
     fn clamp(&self, i: usize) -> usize {
@@ -349,6 +435,45 @@ mod tests {
         let mut empty = Queue::default();
         empty.reverse();
         assert!(empty.is_empty());
+    }
+
+    #[test]
+    fn marks_follow_files() {
+        let mut q = Queue::new(paths(&["a", "b", "c", "d"]), None, 0);
+        assert!(q.set_mark(1, true));
+        assert!(q.set_mark(3, true));
+        assert!(!q.set_mark(3, true));
+        assert_eq!(q.marked_count(), 2);
+        q.reverse();
+        assert!(q.is_marked(0) && q.is_marked(2));
+        assert_eq!(q.marked(), [Path::new("d"), Path::new("b")]);
+        q.invert_marks();
+        assert_eq!(q.marked(), [Path::new("c"), Path::new("a")]);
+        q.remove(Path::new("c"));
+        assert_eq!(q.marked_count(), 1);
+        q.mark_all();
+        assert_eq!(q.marked_count(), 3);
+        q.unmark_all();
+        assert_eq!(q.marked_count(), 0);
+    }
+
+    #[test]
+    fn finding_marks() {
+        let mut q = Queue::new(paths(&["a", "b", "c", "d", "e"]), None, 2);
+        assert_eq!(q.find_mark(true, 1, true), None);
+        q.set_mark(0, true);
+        q.set_mark(4, true);
+        assert_eq!(q.find_mark(true, 1, true), Some(4));
+        assert_eq!(q.find_mark(true, 2, true), Some(0));
+        assert_eq!(q.find_mark(false, 1, true), Some(0));
+        assert_eq!(q.find_mark(false, 2, false), Some(0));
+        q.goto(4);
+        assert_eq!(q.find_mark(true, 1, false), None);
+        assert_eq!(q.find_mark(true, 1, true), Some(0));
+        // The current file alone is not a next mark.
+        q.unmark_all();
+        q.set_mark(4, true);
+        assert_eq!(q.find_mark(true, 1, true), None);
     }
 
     #[test]

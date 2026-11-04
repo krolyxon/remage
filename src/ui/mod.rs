@@ -6,11 +6,12 @@ use std::path::Path;
 use std::time::Instant;
 
 use crate::config::theme::{Rgba, Theme};
+use crate::render::atlas::ThumbDraw;
 use crate::render::image::AlphaStyle;
 use crate::render::prims::Prim;
 use crate::render::text::{Align, FontRole, TextItem};
 use crate::render::{ImageDraw, Scene};
-use crate::state::{AlphaBg, AppState, MsgKind};
+use crate::state::{AlphaBg, AppState, GRID_NAME_SIZE, Mode, MsgKind, ThumbState};
 
 /// Space Mono label tracking.
 const LABEL_TRACKING: f32 = 0.08;
@@ -33,6 +34,7 @@ fn label(text: &str, color: Rgba, sf: f32, x: f32, y: f32, align: Align) -> Text
         y,
         align,
         max_width: None,
+        clip: None,
     }
 }
 
@@ -54,10 +56,28 @@ pub fn scene<'a>(
         image_clip: [0.0, 0.0, w, h - bar_h],
         alpha: alpha_style(state.alpha_bg, theme, sf),
         images: Vec::new(),
+        thumbs: Vec::new(),
+        under: Vec::new(),
         prims: Vec::new(),
         texts: Vec::new(),
     };
 
+    if state.in_grid() {
+        grid(&mut scene, state, theme, now);
+    } else {
+        image(&mut scene, state, now);
+    }
+    if state.queue.is_empty() {
+        empty_state(&mut scene, theme, sf, [w, h - bar_h]);
+    }
+    if bar_h > 0.0 {
+        status_bar(&mut scene, state, theme, now, [w, h], bar_h, measure);
+    }
+    scene
+}
+
+/// The current image, and the previous one fading out under it.
+fn image<'a>(scene: &mut Scene<'a>, state: &'a AppState, now: Instant) {
     let nearest = state.effective_nearest(now);
     if let Some(fade) = &state.fade {
         scene.images.push(ImageDraw {
@@ -77,14 +97,102 @@ pub fn scene<'a>(
             nearest,
         });
     }
+}
 
-    if state.queue.is_empty() {
-        empty_state(&mut scene, theme, sf, [w, h - bar_h]);
+/// `r` grown by `d` on every side.
+fn expand(r: [f32; 4], d: f32) -> [f32; 4] {
+    [r[0] - d, r[1] - d, r[2] + 2.0 * d, r[3] + 2.0 * d]
+}
+
+/// Thumbnails, the cursor, marks and the visual range.
+fn grid<'a>(scene: &mut Scene<'a>, state: &'a AppState, theme: &Theme, now: Instant) {
+    let sf = state.ui_scale();
+    let l = state.grid_layout();
+    // Whole pixels keep 1:1 thumbnails crisp while scrolling.
+    let scroll = state.grid.scroll(&l, now).round();
+    let cursor = state.queue.index();
+    let range = state.visual_range();
+    let line = sf.round().max(1.0);
+    let area = [0.0, 0.0, l.viewport[0], l.viewport[1]];
+    for i in l.visible(scroll) {
+        let Some(path) = state.queue.get(i) else {
+            continue;
+        };
+        let [x, y] = l.origin(i);
+        let cell = [x, y - scroll, l.cell, l.cell];
+        let thumb = state.thumbs.get(path);
+        let rect = match thumb {
+            Some(ThumbState { size, .. }) => {
+                let k = (l.cell / size[0].max(size[1]) as f32).min(1.0);
+                let (tw, th) = ((size[0] as f32 * k).round(), (size[1] as f32 * k).round());
+                [
+                    cell[0] + ((l.cell - tw) * 0.5).floor(),
+                    cell[1] + ((l.cell - th) * 0.5).floor(),
+                    tw,
+                    th,
+                ]
+            }
+            _ => cell,
+        };
+        if range.as_ref().is_some_and(|r| r.contains(&i)) {
+            scene.under.push(Prim::rounded(
+                expand(cell, 6.0 * sf),
+                theme.surface_raised.linear(),
+                8.0 * sf,
+            ));
+        }
+        let (cx, cy) = (cell[0] + l.cell * 0.5, cell[1] + l.cell * 0.5);
+        match thumb {
+            Some(t) => scene.thumbs.push(ThumbDraw {
+                path,
+                rect,
+                alpha: state.thumb_alpha(t.at, now),
+            }),
+            // Pending: one dim dot, no skeleton.
+            None => scene.prims.push(Prim::dot(
+                [cx, cy],
+                2.0 * sf,
+                theme.text_disabled.linear(),
+                None,
+            )),
+        }
+        if state.queue.is_marked(i) {
+            let r = 4.0 * sf;
+            scene.prims.push(Prim::dot(
+                [rect[0] + rect[2] - 2.0 * r, rect[1] + 2.0 * r],
+                r,
+                theme.accent.linear(),
+                Some((theme.background.linear(), line)),
+            ));
+        }
+        if i == cursor {
+            scene.prims.push(Prim::outline(
+                expand(rect, 4.0 * sf),
+                theme.text_display.linear(),
+                4.0 * sf,
+                line,
+            ));
+        }
+        if l.label > 0.0 {
+            let color = if i == cursor {
+                theme.text_primary
+            } else {
+                theme.text_secondary
+            };
+            scene.texts.push(TextItem {
+                spans: vec![(file_name(path), color)],
+                role: FontRole::Ui,
+                size: (GRID_NAME_SIZE * sf).round(),
+                weight: 400,
+                tracking: 0.0,
+                x: cx,
+                y: cell[1] + l.cell + l.label * 0.5,
+                align: Align::Center,
+                max_width: Some(l.cell),
+                clip: Some(area),
+            });
+        }
     }
-    if bar_h > 0.0 {
-        status_bar(&mut scene, state, theme, now, [w, h], bar_h, measure);
-    }
-    scene
 }
 
 fn alpha_style(bg: AlphaBg, theme: &Theme, sf: f32) -> AlphaStyle {
@@ -117,6 +225,7 @@ fn empty_state(scene: &mut Scene, theme: &Theme, sf: f32, area: [f32; 2]) {
         y: cy - 12.0 * sf,
         align: Align::Center,
         max_width: None,
+        clip: None,
     });
     let hint = "remage <file|dir>…";
     scene.texts.push(label(
@@ -169,11 +278,14 @@ fn status_bar(
     if state.skipped > 0 {
         spans.push((format!("[SKIPPED {}]", state.skipped), theme.text_secondary));
     }
+    if let Some(r) = state.visual_range() {
+        spans.push((format!("[VISUAL {}]", r.len()), theme.text_secondary));
+    }
     let mut info = Vec::new();
     if let Some(s) = state
         .shown
         .as_ref()
-        .filter(|s| Some(s.path.as_path()) == state.queue.current())
+        .filter(|s| state.mode == Mode::Image && Some(s.path.as_path()) == state.queue.current())
     {
         info.push(s.format.to_string());
         info.push(format!("{}×{}", s.size[0], s.size[1]));
@@ -201,6 +313,37 @@ fn status_bar(
         scene.texts.push(item);
     }
 
+    // Marks: an accent dot and the count, filled when the current file is marked.
+    let marks = state.queue.marked_count();
+    if marks > 0 {
+        let gap = if right_w > 0.0 { 16.0 * sf } else { 0.0 };
+        let item = label(
+            &marks.to_string(),
+            theme.text_secondary,
+            sf,
+            w - pad - right_w - gap,
+            y,
+            Align::Right,
+        );
+        let count_w = measure(&item);
+        scene.texts.push(item);
+        let r = 3.0 * sf;
+        let cx = w - pad - right_w - gap - count_w - 6.0 * sf - r;
+        let accent = theme.accent.linear();
+        let dot = if state.queue.is_marked(state.queue.index()) {
+            Prim::dot([cx, y], r, accent, None)
+        } else {
+            Prim::outline(
+                [cx - r, y - r, 2.0 * r, 2.0 * r],
+                accent,
+                r,
+                sf.round().max(1.0),
+            )
+        };
+        scene.prims.push(dot);
+        right_w += gap + count_w + 6.0 * sf + 2.0 * r;
+    }
+
     // The filename takes whatever the right side leaves, ellipsised in the middle.
     if let Some(cur) = state.queue.current() {
         let room = (w - 2.0 * pad - right_w - 32.0 * sf).max(0.0);
@@ -214,6 +357,7 @@ fn status_bar(
             y,
             align: Align::Left,
             max_width: Some(room),
+            clip: None,
         });
     }
 }
