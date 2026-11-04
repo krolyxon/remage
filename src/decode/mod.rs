@@ -228,7 +228,13 @@ fn ftyp_brands(head: &[u8]) -> Vec<&[u8]> {
     let len = u32::from_be_bytes([head[0], head[1], head[2], head[3]]) as usize;
     let end = len.clamp(16, head.len());
     let mut brands = vec![&head[8..12]];
-    brands.extend(head[16..end].chunks_exact(4));
+    brands.extend(
+        head[16..end]
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|b| b.as_slice()),
+    );
     brands
 }
 

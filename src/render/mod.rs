@@ -412,7 +412,7 @@ impl Renderer {
         let mut pixels = Vec::with_capacity((size[0] * size[1] * 4) as usize);
         for y in 0..size[1] as usize {
             let line = &data[y * row as usize..][..size[0] as usize * 4];
-            for px in line.chunks_exact(4) {
+            for px in line.as_chunks::<4>().0.iter() {
                 let rgb = if bgra {
                     [px[2], px[1], px[0]]
                 } else {

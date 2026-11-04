@@ -92,7 +92,9 @@ fn aces(x: f32) -> f32 {
 /// within 0..1 are only encoded; brighter ones are tone-mapped.
 pub fn tonemap(rgba: &[f32]) -> Vec<u8> {
     let peak = rgba
-        .chunks_exact(4)
+        .as_chunks::<4>()
+        .0
+        .iter()
         .flat_map(|p| &p[..3])
         .copied()
         .filter(|v| v.is_finite())
@@ -100,7 +102,7 @@ pub fn tonemap(rgba: &[f32]) -> Vec<u8> {
     let hdr = peak > 1.0;
     let to8 = |v: f32| (v.clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
     let mut out = Vec::with_capacity(rgba.len());
-    for p in rgba.chunks_exact(4) {
+    for p in rgba.as_chunks::<4>().0.iter() {
         for &c in &p[..3] {
             let c = if c.is_finite() { c.max(0.0) } else { 0.0 };
             let c = if hdr { aces(c) } else { c };
@@ -149,11 +151,15 @@ pub fn expand(samples: &[u8], channels: usize) -> Vec<u8> {
     match channels {
         4 => samples.to_vec(),
         3 => samples
-            .chunks_exact(3)
+            .as_chunks::<3>()
+            .0
+            .iter()
             .flat_map(|p| [p[0], p[1], p[2], 255])
             .collect(),
         2 => samples
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .flat_map(|p| [p[0], p[0], p[0], p[1]])
             .collect(),
         _ => samples.iter().flat_map(|&g| [g, g, g, 255]).collect(),

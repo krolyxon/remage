@@ -178,12 +178,16 @@ fn to_rgba(buf: Vec<u8>, color: png::ColorType) -> Option<Vec<u8>> {
     Some(match color {
         Rgba => buf,
         Rgb => buf
-            .chunks_exact(3)
+            .as_chunks::<3>()
+            .0
+            .iter()
             .flat_map(|p| [p[0], p[1], p[2], 255])
             .collect(),
         Grayscale => buf.iter().flat_map(|&g| [g, g, g, 255]).collect(),
         GrayscaleAlpha => buf
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .flat_map(|p| [p[0], p[0], p[0], p[1]])
             .collect(),
         Indexed => return None,
@@ -443,7 +447,9 @@ fn jpeg_scaled(path: &Path, max: u32) -> anyhow::Result<Option<Generated>> {
     let pixels: Vec<u8> = match info.pixel_format {
         L8 => data.iter().flat_map(|&g| [g, g, g, 255]).collect(),
         _ => data
-            .chunks_exact(3)
+            .as_chunks::<3>()
+            .0
+            .iter()
             .flat_map(|p| [p[0], p[1], p[2], 255])
             .collect(),
     };
