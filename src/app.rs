@@ -4,7 +4,9 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
+
+use serde_json::{Value, json};
 
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
@@ -16,11 +18,13 @@ use winit::window::{Fullscreen, Window, WindowId};
 use crate::action::{Action, ModeArg, Switch, Zoom};
 use crate::cache::ImageCache;
 use crate::config::watch::ConfigWatch;
-use crate::config::{Config, LoadError, Loaded};
+use crate::config::{Config, LoadError, Loaded, Output, Targets, suggest};
 use crate::decode::{self, DecodedImage};
+use crate::exec;
 use crate::input::keymap::{KeyTables, Keymap};
 use crate::input::keys::{Key, Scroll};
 use crate::input::{self};
+use crate::ipc::{self, Query, Request, Topic};
 use crate::render::{Renderer, text};
 use crate::scan;
 use crate::state::view::{Dir, FitMode};
@@ -51,6 +55,8 @@ const DOUBLE_CLICK: Duration = Duration::from_millis(400);
 pub enum UserEvent {
     Decoded {
         path: PathBuf,
+        /// The file's mtime when decoding started, for `refresh`.
+        mtime: Option<SystemTime>,
         result: Result<Arc<DecodedImage>, String>,
     },
     /// Unknown-extension files that turned out to be images.
@@ -65,8 +71,15 @@ pub enum UserEvent {
     Thumb {
         path: PathBuf,
         px: u32,
+        mtime: Option<SystemTime>,
         result: Result<Thumb, ThumbError>,
     },
+    /// Output or the exit of a user command.
+    Command { id: u64, event: exec::Event },
+    /// `refresh` re-checked these files: their mtime, or `None` if they are gone.
+    Refreshed(Vec<(PathBuf, Option<SystemTime>)>),
+    /// A request on the IPC socket.
+    Ipc(ipc::Incoming),
 }
 
 /// Command-line settings that beat the config, across reloads too.
@@ -95,6 +108,43 @@ pub struct Options {
     pub overrides: Overrides,
     /// Never write the shared thumbnail cache (`-p`).
     pub private: bool,
+    /// The IPC socket, passed to commands as `$REMAGE_SOCKET`.
+    pub socket: Option<PathBuf>,
+}
+
+/// Where a chain of actions came from, which decides what some of them act on.
+#[derive(Clone, Debug, Default)]
+struct Ctx {
+    /// The cursor, for mouse-triggered zoom.
+    anchor: Option<[f32; 2]>,
+    /// A command's targets, which its `refresh` re-checks (otherwise the whole queue).
+    targets: Option<Arc<[PathBuf]>>,
+}
+
+/// A user command from spawn to exit.
+struct Job {
+    name: String,
+    output: Output,
+    targets: Arc<[PathBuf]>,
+    /// The command's `after` actions, then whatever followed `run` in its binding: they wait
+    /// for a successful exit.
+    then: Vec<Action>,
+    /// stdout lines run as actions so far.
+    lines: usize,
+}
+
+/// An IPC connection streaming events.
+struct Subscriber {
+    topics: Vec<Topic>,
+    tx: crossbeam_channel::Sender<String>,
+}
+
+/// What subscribers last heard about.
+#[derive(Clone, Debug, PartialEq)]
+struct Published {
+    image: (Option<PathBuf>, usize, usize),
+    marks: u64,
+    mode: Mode,
 }
 
 /// Thumbnail jobs for the current cell size.
@@ -153,6 +203,16 @@ pub struct App {
     held: HashMap<PhysicalKey, Dir>,
     started: Instant,
     shown_window: bool,
+    /// File mtimes when they were last decoded or thumbnailed, so `refresh` spots changes.
+    stamps: HashMap<PathBuf, SystemTime>,
+    jobs: HashMap<u64, Job>,
+    next_job: u64,
+    /// A command waiting for `y` at its confirm prompt.
+    confirm: Option<(Job, exec::Prepared)>,
+    subscribers: Vec<Subscriber>,
+    published: Option<Published>,
+    /// `quit-no-output` ran: `-o` prints nothing.
+    no_output: bool,
     pub error: Option<anyhow::Error>,
 }
 
@@ -196,6 +256,13 @@ impl App {
             held: HashMap::new(),
             started: Instant::now(),
             shown_window: false,
+            stamps: HashMap::new(),
+            jobs: HashMap::new(),
+            next_job: 1,
+            confirm: None,
+            subscribers: Vec::new(),
+            published: None,
+            no_output: false,
             error: None,
         };
         // Decode the first image while the window and GPU come up.
@@ -220,12 +287,17 @@ impl App {
         self.pool
             .submit(JobKey::Decode(path.clone()), prio, move || {
                 let t = Instant::now();
+                let mtime = mtime(&path);
                 let result = decode::decode(&path, max_dim.load(Ordering::Relaxed))
                     .map(Arc::new)
                     .map_err(|e| e.to_string());
                 log::debug!("decoded {} in {:.1?}", path.display(), t.elapsed());
                 lock(&arriving).insert(path.clone());
-                let _ = proxy.send_event(UserEvent::Decoded { path, result });
+                let _ = proxy.send_event(UserEvent::Decoded {
+                    path,
+                    mtime,
+                    result,
+                });
             });
     }
 
@@ -377,19 +449,36 @@ impl App {
         self.pool
             .submit(JobKey::Thumb(path.clone()), prio, move || {
                 let t = Instant::now();
+                let mtime = mtime(&path);
                 let result = thumbs::load(&path, px, &cache);
                 log::trace!("thumbnail {} in {:.1?}", path.display(), t.elapsed());
-                let _ = proxy.send_event(UserEvent::Thumb { path, px, result });
+                let _ = proxy.send_event(UserEvent::Thumb {
+                    path,
+                    px,
+                    mtime,
+                    result,
+                });
             });
     }
 
-    fn on_thumb(&mut self, path: PathBuf, px: u32, result: Result<Thumb, ThumbError>) {
+    fn on_thumb(
+        &mut self,
+        path: PathBuf,
+        px: u32,
+        mtime: Option<SystemTime>,
+        result: Result<Thumb, ThumbError>,
+    ) {
         self.thumbs.requested.remove(&path);
         if px != self.thumbs.cell {
             return;
         }
         match result {
-            Ok(t) => self.thumbs.arrivals.push_back((path, t)),
+            Ok(t) => {
+                if let Some(m) = mtime {
+                    self.stamps.insert(path.clone(), m);
+                }
+                self.thumbs.arrivals.push_back((path, t));
+            }
             Err(e) => {
                 // Undecodable: it leaves the queue, as in image mode.
                 log::warn!("{}: {e}", path.display());
@@ -514,13 +603,21 @@ impl App {
         self.request_redraw();
     }
 
-    fn on_decoded(&mut self, path: PathBuf, result: Result<Arc<DecodedImage>, String>) {
+    fn on_decoded(
+        &mut self,
+        path: PathBuf,
+        mtime: Option<SystemTime>,
+        result: Result<Arc<DecodedImage>, String>,
+    ) {
         lock(&self.arriving).remove(&path);
         let now = Instant::now();
         let is_current = self.state.queue.current() == Some(path.as_path());
         let in_grid = self.state.in_grid();
         match result {
             Ok(img) => {
+                if let Some(m) = mtime {
+                    self.stamps.insert(path.clone(), m);
+                }
                 let wanted = self.window_paths();
                 let keep: Vec<&Path> = wanted.iter().map(PathBuf::as_path).collect();
                 self.cache.insert(path.clone(), img.clone(), &keep);
@@ -559,23 +656,371 @@ impl App {
         }
     }
 
-    /// Run actions in order; `anchor` is the cursor for mouse-triggered ones.
-    fn run(&mut self, actions: Vec<Action>, anchor: Option<[f32; 2]>, el: &ActiveEventLoop) {
-        for action in actions {
-            if action == Action::Cancel {
-                self.keymap.cancel();
-                self.state.pending.clear();
-                self.config_error = false;
+    /// Run actions in order. A `run` suspends the rest of the chain until its command exits
+    /// successfully. Errors are shown on the status line; the first is also returned for IPC.
+    fn run(&mut self, actions: Vec<Action>, ctx: &Ctx, el: &ActiveEventLoop) -> Result<(), String> {
+        let mut rest = actions.into_iter();
+        while let Some(action) = rest.next() {
+            match &action {
+                Action::Run(name) => return self.start_command(name, rest.collect()),
+                Action::Cancel => {
+                    self.keymap.cancel();
+                    self.state.pending.clear();
+                    self.config_error = false;
+                    self.answer(false);
+                }
+                Action::QuitNoOutput => self.no_output = true,
+                _ => {}
             }
-            let fx = self.state.apply_at(action, anchor, Instant::now());
-            self.effects(fx, el);
+            let fx = self.state.apply_at(action, ctx.anchor, Instant::now());
+            self.effects(fx, ctx, el);
             if fx.quit {
-                return;
+                break;
+            }
+        }
+        Ok(())
+    }
+
+    /// Start `[commands.<name>]`, or ask first when it has a `confirm`.
+    fn start_command(&mut self, name: &str, then: Vec<Action>) -> Result<(), String> {
+        let now = Instant::now();
+        let fail = |state: &mut AppState, msg: String| {
+            state.notify(format!("error: {msg}"), MsgKind::Error, now);
+            Err(msg)
+        };
+        let Some(cmd) = self.config.commands.get(name).cloned() else {
+            let hint = suggest(name, self.config.commands.keys().map(String::as_str))
+                .map(|s| format!(", did you mean `{s}`?"))
+                .unwrap_or_default();
+            self.request_redraw();
+            return fail(&mut self.state, format!("no command named `{name}`{hint}"));
+        };
+        let q = &self.state.queue;
+        let targets: Arc<[PathBuf]> =
+            exec::targets(cmd.targets, q.current(), &q.marked(), q.files()).into();
+        if targets.is_empty() && exec::needs_files(&cmd) {
+            let why = if cmd.targets == Targets::Marked {
+                "no marked files"
+            } else {
+                "no images"
+            };
+            self.request_redraw();
+            return fail(&mut self.state, format!("{name}: {why}"));
+        }
+        let size = self
+            .state
+            .shown
+            .as_ref()
+            .filter(|s| Some(s.path.as_path()) == q.current())
+            .map(|s| s.size);
+        let ctx = exec::Context {
+            current: q.current(),
+            index: q.index(),
+            targets: &targets,
+            size,
+            mode: self.state.mode.name(),
+            socket: self.opts.socket.as_deref(),
+        };
+        let prepared = exec::prepare(&cmd, &ctx);
+        let question = cmd.confirm.as_deref().map(|c| exec::expand_text(c, &ctx));
+        let mut chain = cmd.after.0.unwrap_or_default();
+        chain.extend(then);
+        let job = Job {
+            name: name.to_string(),
+            output: cmd.output,
+            targets,
+            then: chain,
+            lines: 0,
+        };
+        match question {
+            Some(q) => {
+                self.answer(false);
+                self.state.prompt = Some(q);
+                self.confirm = Some((job, prepared));
+                self.request_redraw();
+            }
+            None => self.spawn_job(job, prepared),
+        }
+        Ok(())
+    }
+
+    /// Settle a confirm prompt: `y` runs the command, anything else drops it.
+    fn answer(&mut self, yes: bool) {
+        let Some((job, prepared)) = self.confirm.take() else {
+            return;
+        };
+        self.state.prompt = None;
+        if yes {
+            self.spawn_job(job, prepared);
+        }
+        self.request_redraw();
+    }
+
+    fn spawn_job(&mut self, job: Job, prepared: exec::Prepared) {
+        let id = self.next_job;
+        self.next_job += 1;
+        log::info!(
+            "run {}: {} {:?}",
+            job.name,
+            prepared.program.to_string_lossy(),
+            prepared.args
+        );
+        let proxy = self.proxy.clone();
+        exec::spawn(&job.name, prepared, job.output, move |event| {
+            let _ = proxy.send_event(UserEvent::Command { id, event });
+        });
+        self.state.running.push((id, job.name.clone()));
+        self.jobs.insert(id, job);
+        self.request_redraw();
+    }
+
+    fn on_command(&mut self, id: u64, event: exec::Event, el: &ActiveEventLoop) {
+        let now = Instant::now();
+        match event {
+            exec::Event::Line(line) => {
+                let Some(job) = self.jobs.get_mut(&id) else {
+                    return;
+                };
+                job.lines += 1;
+                let name = job.name.clone();
+                let ctx = Ctx {
+                    anchor: None,
+                    targets: Some(job.targets.clone()),
+                };
+                match line.parse::<Action>() {
+                    Ok(a) => {
+                        let _ = self.run(vec![a], &ctx, el);
+                    }
+                    Err(e) => {
+                        log::warn!("{name}: {line}: {e}");
+                        self.state
+                            .notify(format!("error: {name}: {e}"), MsgKind::Error, now);
+                        self.request_redraw();
+                    }
+                }
+            }
+            exec::Event::Done(outcome) => {
+                let Some(job) = self.jobs.remove(&id) else {
+                    return;
+                };
+                self.state.running.retain(|(j, _)| *j != id);
+                self.request_redraw();
+                if !outcome.success() {
+                    let msg = format!("error: {}", outcome.error());
+                    log::warn!("{}: {msg}", job.name);
+                    self.state.notify(msg, MsgKind::Error, now);
+                    return;
+                }
+                log::debug!("{}: done", job.name);
+                match (job.output, outcome.last_line) {
+                    (Output::Status, Some(line)) => self.state.notify(line, MsgKind::Info, now),
+                    // Actions speak for themselves.
+                    (Output::Actions, _) if job.lines > 0 => {}
+                    _ => self.state.notify("done", MsgKind::Info, now),
+                }
+                let ctx = Ctx {
+                    anchor: None,
+                    targets: Some(job.targets),
+                };
+                let _ = self.run(job.then, &ctx, el);
             }
         }
     }
 
-    fn effects(&mut self, fx: Effects, event_loop: &ActiveEventLoop) {
+    /// Re-check `targets` (default: the whole queue, plus the current file) on disk, off-thread.
+    fn refresh(&mut self, targets: Option<Arc<[PathBuf]>>) {
+        let mut files: Vec<PathBuf> = match targets {
+            Some(t) => t.to_vec(),
+            None => self.state.queue.files().to_vec(),
+        };
+        if let Some(cur) = self.state.queue.current()
+            && !files.iter().any(|f| f == cur)
+        {
+            files.push(cur.to_path_buf());
+        }
+        let proxy = self.proxy.clone();
+        std::thread::spawn(move || {
+            let found = files
+                .into_iter()
+                .map(|p| {
+                    let m = std::fs::metadata(&p)
+                        .ok()
+                        .map(|m| m.modified().unwrap_or(SystemTime::UNIX_EPOCH));
+                    (p, m)
+                })
+                .collect();
+            let _ = proxy.send_event(UserEvent::Refreshed(found));
+        });
+    }
+
+    /// Drop files that vanished and reload ones that changed since they were loaded.
+    fn on_refreshed(&mut self, found: Vec<(PathBuf, Option<SystemTime>)>) {
+        let cur = self.state.queue.current().map(Path::to_path_buf);
+        let showing = |s: &AppState, p: &Path| {
+            s.mode == Mode::Image && s.shown.as_ref().is_some_and(|s| s.path == p)
+        };
+        let mut navigated = false;
+        let mut stale = Vec::new();
+        let mut gone = 0;
+        for (path, mtime) in found {
+            match mtime {
+                None => {
+                    if self.state.queue.remove(&path) {
+                        gone += 1;
+                        navigated |= cur.as_ref() == Some(&path);
+                    }
+                    self.cache.remove(&path);
+                    self.stamps.remove(&path);
+                    self.state.thumbs.remove(&path);
+                }
+                Some(t) if self.stamps.get(&path).is_some_and(|s| *s != t) => stale.push(path),
+                Some(_) => {}
+            }
+        }
+        let mut reload_current = false;
+        for path in &stale {
+            self.cache.remove(path);
+            self.stamps.remove(path);
+            self.state.thumbs.remove(path);
+            self.uploads.retain(|(p, _)| p != path);
+            if cur.as_ref() == Some(path) && showing(&self.state, path) {
+                // Keep it on screen until the new version replaces it.
+                reload_current = true;
+            } else if let Some(g) = &mut self.gfx {
+                g.renderer.retain(|p| p != path);
+            }
+        }
+        if gone + stale.len() > 0 {
+            log::debug!("refresh: {gone} gone, {} changed", stale.len());
+        }
+        if reload_current && let Some(cur) = &cur {
+            self.decode(cur, Priority::Current);
+        }
+        if gone + stale.len() > 0 {
+            self.sync(navigated);
+            self.request_redraw();
+        }
+    }
+
+    fn on_ipc(&mut self, inc: ipc::Incoming, el: &ActiveEventLoop) {
+        let reply = match inc.request {
+            Request::Actions(actions) => match self.run(actions, &Ctx::default(), el) {
+                Ok(()) => ipc::ok(Value::Null),
+                Err(e) => ipc::error(&e),
+            },
+            Request::Query(q) => ipc::ok(self.query(q)),
+            Request::Subscribe(topics) => match inc.events {
+                Some(tx) => {
+                    if self.published.is_none() {
+                        self.published = Some(self.snapshot());
+                    }
+                    self.subscribers.push(Subscriber { topics, tx });
+                    ipc::ok(Value::Null)
+                }
+                None => ipc::error("no event channel"),
+            },
+        };
+        let _ = inc.reply.send(reply);
+    }
+
+    fn query(&self, q: Query) -> Value {
+        let s = &self.state;
+        let paths = |ps: &mut dyn Iterator<Item = &Path>| -> Value {
+            ps.map(ipc::path_json).collect::<Vec<_>>().into()
+        };
+        match q {
+            Query::Current => s.queue.current().map_or(Value::Null, ipc::path_json),
+            Query::Marked => paths(&mut s.queue.marked().into_iter()),
+            Query::Queue => paths(&mut s.queue.files().iter().map(PathBuf::as_path)),
+            Query::State => {
+                let shown = s
+                    .shown
+                    .as_ref()
+                    .filter(|sh| Some(sh.path.as_path()) == s.queue.current());
+                let fullscreen = self
+                    .gfx
+                    .as_ref()
+                    .is_some_and(|g| g.window.fullscreen().is_some());
+                json!({
+                    "mode": s.mode.name(),
+                    "current": s.queue.current().map(ipc::path_json),
+                    "index": (!s.queue.is_empty()).then(|| s.queue.index() + 1),
+                    "count": s.queue.len(),
+                    "marked": s.queue.marked_count(),
+                    "width": shown.map(|sh| sh.size[0]),
+                    "height": shown.map(|sh| sh.size[1]),
+                    "format": shown.map(|sh| sh.format),
+                    "zoom": shown.map(|_| (s.view.scale() * 1000.0).round() / 10.0),
+                    "fit": s.settings.fit,
+                    "bar": s.bar,
+                    "fullscreen": fullscreen,
+                    "skipped": s.skipped,
+                    "running": s.running.iter().map(|(_, n)| n.as_str()).collect::<Vec<_>>(),
+                    "pid": std::process::id(),
+                })
+            }
+        }
+    }
+
+    fn snapshot(&self) -> Published {
+        let q = &self.state.queue;
+        Published {
+            image: (q.current().map(Path::to_path_buf), q.index(), q.len()),
+            marks: q.marks_version(),
+            mode: self.state.mode,
+        }
+    }
+
+    /// Tell subscribers what changed since they last heard.
+    fn publish(&mut self) {
+        if self.subscribers.is_empty() {
+            self.published = None;
+            return;
+        }
+        let now = self.snapshot();
+        let Some(before) = self.published.replace(now.clone()) else {
+            return;
+        };
+        let q = &self.state.queue;
+        let mut events = Vec::new();
+        if before.image != now.image {
+            let data = json!({
+                "path": q.current().map(ipc::path_json),
+                "index": (!q.is_empty()).then(|| q.index() + 1),
+                "count": q.len(),
+            });
+            events.push((Topic::Image, data));
+        }
+        if before.marks != now.marks {
+            let files: Vec<Value> = q.marked().into_iter().map(ipc::path_json).collect();
+            events.push((
+                Topic::Marks,
+                json!({ "count": files.len(), "files": files }),
+            ));
+        }
+        if before.mode != now.mode {
+            events.push((Topic::Mode, json!(now.mode.name())));
+        }
+        for (topic, data) in events {
+            let line = ipc::event(topic, data);
+            self.subscribers
+                .retain(|s| !s.topics.contains(&topic) || s.tx.send(line.clone()).is_ok());
+        }
+    }
+
+    /// Marked files for `-o`, unless the user quit with `quit-no-output`.
+    pub fn marked_output(&self) -> Option<Vec<PathBuf>> {
+        (!self.no_output).then(|| {
+            self.state
+                .queue
+                .marked()
+                .into_iter()
+                .map(Path::to_path_buf)
+                .collect()
+        })
+    }
+
+    fn effects(&mut self, fx: Effects, ctx: &Ctx, event_loop: &ActiveEventLoop) {
         if fx.quit {
             event_loop.exit();
             return;
@@ -600,6 +1045,9 @@ impl App {
         if fx.reload_config {
             self.reload_requested = true;
             self.watch.reload();
+        }
+        if fx.refresh {
+            self.refresh(ctx.targets.clone());
         }
         if let Some(key) = fx.sort {
             let mut files = self.state.queue.files().to_vec();
@@ -653,13 +1101,22 @@ impl App {
             }
             return;
         }
+        if self.confirm.is_some() {
+            // The prompt takes the next key: `y` runs the command, anything else cancels.
+            if !event.repeat
+                && let Some(key) = input::key(&event.logical_key, self.modifiers)
+            {
+                self.answer(key == Key::plain('y') || key == Key::plain('Y'));
+            }
+            return;
+        }
         if event.repeat {
             // Repeats bypass the trie: only a completed, repeatable binding repeats.
             if let Some((k, actions)) = &self.repeat
                 && *k == event.physical_key
             {
                 let actions = actions.clone();
-                self.run(actions, None, event_loop);
+                let _ = self.run(actions, &Ctx::default(), event_loop);
             }
             return;
         }
@@ -684,7 +1141,7 @@ impl App {
             if !actions.is_empty() && actions.iter().all(Action::repeats) {
                 self.repeat = Some((event.physical_key, actions.clone()));
             }
-            self.run(actions, None, event_loop);
+            let _ = self.run(actions, &Ctx::default(), event_loop);
         }
     }
 
@@ -694,7 +1151,11 @@ impl App {
         self.update_pending(Instant::now());
         if let Some(actions) = self.keymap.lookup(self.state.mode, &[key]) {
             let actions = actions.to_vec();
-            self.run(actions, Some(self.cursor), event_loop);
+            let ctx = Ctx {
+                anchor: Some(self.cursor),
+                ..Ctx::default()
+            };
+            let _ = self.run(actions, &ctx, event_loop);
         }
     }
 
@@ -780,7 +1241,7 @@ impl App {
         if double {
             actions.push(Action::Mode(ModeArg::Image));
         }
-        self.run(actions, None, event_loop);
+        let _ = self.run(actions, &Ctx::default(), event_loop);
     }
 
     fn redraw(&mut self) {
@@ -896,6 +1357,10 @@ fn font_families(c: &Config) -> [String; 3] {
     ]
 }
 
+fn mtime(path: &Path) -> Option<SystemTime> {
+    std::fs::metadata(path).and_then(|m| m.modified()).ok()
+}
+
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
@@ -977,9 +1442,13 @@ impl ApplicationHandler<UserEvent> for App {
         self.sync(false);
     }
 
-    fn user_event(&mut self, _event_loop: &ActiveEventLoop, event: UserEvent) {
+    fn user_event(&mut self, event_loop: &ActiveEventLoop, event: UserEvent) {
         match event {
-            UserEvent::Decoded { path, result } => self.on_decoded(path, result),
+            UserEvent::Decoded {
+                path,
+                mtime,
+                result,
+            } => self.on_decoded(path, mtime, result),
             UserEvent::Found(paths) => {
                 log::debug!("sniffing found {} more images", paths.len());
                 let was_empty = self.state.queue.is_empty();
@@ -1006,7 +1475,15 @@ impl ApplicationHandler<UserEvent> for App {
                 self.state.queue.reorder(files);
                 self.sync(false);
             }
-            UserEvent::Thumb { path, px, result } => self.on_thumb(path, px, result),
+            UserEvent::Thumb {
+                path,
+                px,
+                mtime,
+                result,
+            } => self.on_thumb(path, px, mtime, result),
+            UserEvent::Command { id, event } => self.on_command(id, event, event_loop),
+            UserEvent::Refreshed(found) => self.on_refreshed(found),
+            UserEvent::Ipc(inc) => self.on_ipc(inc, event_loop),
         }
     }
 
@@ -1107,7 +1584,7 @@ impl ApplicationHandler<UserEvent> for App {
             let runs = self.keymap.timeout(self.state.mode);
             self.update_pending(now);
             for run in runs {
-                self.run(run.counted(), None, event_loop);
+                let _ = self.run(run.counted(), &Ctx::default(), event_loop);
             }
         }
         if let Some(t) = self.grid_rest
@@ -1121,6 +1598,7 @@ impl ApplicationHandler<UserEvent> for App {
                 self.decode(&cur, Priority::Preload);
             }
         }
+        self.publish();
         let (redraw, mut next) = self.state.tick(now);
         if let Some(t) = self.grid_rest {
             let at = t + GRID_REST;

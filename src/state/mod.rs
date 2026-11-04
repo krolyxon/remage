@@ -42,6 +42,16 @@ pub enum Mode {
     Visual,
 }
 
+impl Mode {
+    pub fn name(self) -> &'static str {
+        match self {
+            Mode::Image => "image",
+            Mode::Grid => "grid",
+            Mode::Visual => "visual",
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct Settings {
     pub fit: FitMode,
@@ -191,6 +201,8 @@ pub struct Effects {
     pub fullscreen: Option<Switch>,
     pub reload: bool,
     pub reload_config: bool,
+    /// Re-check files on disk: drop missing ones, re-decode changed ones.
+    pub refresh: bool,
     /// Re-sort the queue (stat-based keys need the filesystem, so the loop does it).
     pub sort: Option<SortKey>,
     pub quit: bool,
@@ -220,6 +232,10 @@ pub struct AppState {
     pub message: Option<Message>,
     /// Keys typed so far of an incomplete sequence.
     pub pending: String,
+    /// An inline yes/no question (`DELETE 3 FILES?`) waiting for `y`.
+    pub prompt: Option<String>,
+    /// User commands still running, oldest first: (job id, name).
+    pub running: Vec<(u64, String)>,
     window: [f32; 2],
     scale_factor: f32,
     holds: Vec<Hold>,
@@ -247,6 +263,8 @@ impl AppState {
             skipped: 0,
             message: None,
             pending: String::new(),
+            prompt: None,
+            running: Vec::new(),
             window: [1.0, 1.0],
             scale_factor: 1.0,
             holds: Vec::new(),
@@ -617,6 +635,9 @@ impl AppState {
                 }
             }
             Action::ReloadConfig => fx.reload_config = true,
+            Action::Refresh => fx.refresh = true,
+            // The event loop runs commands: they spawn processes and may wait for a `y`.
+            Action::Run(_) => fx.redraw = false,
             Action::Echo(msg) => self.notify(msg, MsgKind::Info, now),
             Action::Cancel => self.message = None,
             Action::Quit | Action::QuitNoOutput => fx.quit = true,
@@ -645,9 +666,7 @@ impl AppState {
             | Action::Search
             | Action::Filter(_)
             | Action::FilterClear
-            | Action::Refresh
-            | Action::Open(_)
-            | Action::Run(_)) => {
+            | Action::Open(_)) => {
                 self.notify(
                     format!("{} not available yet", other.name()),
                     MsgKind::Info,
@@ -919,6 +938,8 @@ mod tests {
             s.message.as_ref().map(|m| m.text.as_str()),
             Some("palette not available yet")
         );
+        assert!(s.apply(Action::Refresh, now).refresh);
+        assert!(!s.apply(Action::Run("x".into()), now).redraw);
         s.apply(Action::Echo("hi".into()), now);
         assert_eq!(s.message.as_ref().map(|m| m.text.as_str()), Some("hi"));
         assert!(s.apply(Action::Random, now).navigated);

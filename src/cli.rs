@@ -2,16 +2,36 @@
 
 use std::path::PathBuf;
 
-use clap::Parser;
+use clap::{Parser, Subcommand};
 
 use crate::state::queue::SortKey;
 use crate::state::view::FitMode;
 
 #[derive(Parser, Debug)]
-#[command(name = "remage", version, about = "Keyboard-centric image viewer")]
+#[command(
+    name = "remage",
+    version,
+    about = "Keyboard-centric image viewer",
+    args_conflicts_with_subcommands = true
+)]
 pub struct Cli {
+    #[command(subcommand)]
+    pub command: Option<Sub>,
+
     /// Files or directories to open [default: .]
     pub paths: Vec<PathBuf>,
+
+    /// Read file paths from stdin, one per line
+    #[arg(short = 'i', long)]
+    pub stdin: bool,
+
+    /// Paths on stdin and printed by -o are NUL-separated
+    #[arg(short = '0', long)]
+    pub null: bool,
+
+    /// Print the marked files on exit
+    #[arg(short = 'o', long)]
+    pub print_marked: bool,
 
     /// Descend into directories
     #[arg(short, long)]
@@ -78,6 +98,32 @@ pub struct Cli {
     pub check_config: bool,
 }
 
+#[derive(Subcommand, Debug)]
+pub enum Sub {
+    /// Send an action or query to a running remage
+    Msg {
+        /// The instance to talk to [default: $REMAGE_SOCKET, else the newest]
+        #[arg(long, value_name = "PID")]
+        pid: Option<u32>,
+
+        /// Print current, marked, queue or state
+        #[arg(long, value_name = "Q", conflicts_with_all = ["subscribe", "action"])]
+        query: Option<String>,
+
+        /// Stream events (image, marks, mode) as JSON lines
+        #[arg(long, value_name = "EV", conflicts_with = "action")]
+        subscribe: Vec<String>,
+
+        /// The action, e.g. `goto 5`
+        #[arg(
+            value_name = "ACTION",
+            trailing_var_arg = true,
+            allow_hyphen_values = true
+        )]
+        action: Vec<String>,
+    },
+}
+
 fn parse_geometry(s: &str) -> Result<(u32, u32), String> {
     let (w, h) = s
         .split_once(['x', 'X'])
@@ -97,6 +143,20 @@ mod tests {
     #[test]
     fn cli_is_consistent() {
         Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn msg_subcommand() {
+        let c = Cli::try_parse_from(["remage", "msg", "goto", "5"]).unwrap();
+        match c.command {
+            Some(Sub::Msg { action, .. }) => assert_eq!(action, ["goto", "5"]),
+            other => panic!("{other:?}"),
+        }
+        let c = Cli::try_parse_from(["remage", "msg", "slideshow-delay", "-1"]).unwrap();
+        assert!(matches!(c.command, Some(Sub::Msg { action, .. }) if action[1] == "-1"));
+        assert!(Cli::try_parse_from(["remage", "msg", "--query", "x", "next"]).is_err());
+        let c = Cli::try_parse_from(["remage", "-io0", "a.png"]).unwrap();
+        assert!(c.stdin && c.print_marked && c.null && c.command.is_none());
     }
 
     #[test]

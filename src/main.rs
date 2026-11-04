@@ -17,7 +17,10 @@ mod thumbs;
 mod ui;
 mod worker;
 
-use std::path::Path;
+use std::ffi::OsString;
+use std::io::{Read, Write};
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
+use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use clap::Parser;
@@ -31,6 +34,20 @@ fn main() -> anyhow::Result<()> {
     let started = Instant::now();
     env_logger::init();
     let cli = cli::Cli::parse();
+    if let Some(cli::Sub::Msg {
+        pid,
+        query,
+        subscribe,
+        action,
+    }) = cli.command
+    {
+        std::process::exit(ipc::client(ipc::ClientArgs {
+            pid,
+            query,
+            subscribe,
+            action,
+        }));
+    }
     if cli.dump_config {
         print!("{}", config::dump());
         return Ok(());
@@ -55,15 +72,25 @@ fn main() -> anyhow::Result<()> {
     log::debug!("config loaded after {:.1?}", started.elapsed());
     let cfg = &loaded.config;
 
-    let scan = scan::scan(
-        &cli.paths,
-        &scan::ScanOptions {
-            recursive: cli.recursive || cfg.general.recursive,
-            siblings: !cli.no_siblings && cfg.general.open_siblings,
-            sort: cli.sort.unwrap_or(cfg.general.sort),
-            reverse: cli.reverse || cfg.general.reverse,
-        },
-    );
+    let mut paths = cli.paths.clone();
+    if cli.stdin {
+        paths.extend(read_stdin_paths(cli.null)?);
+    }
+    let scan = if cli.stdin && paths.is_empty() {
+        // An empty list on stdin opens nothing, not the current directory.
+        scan::Scan::default()
+    } else {
+        scan::scan(
+            &paths,
+            &scan::ScanOptions {
+                recursive: cli.recursive || cfg.general.recursive,
+                // A list of files is just those files.
+                siblings: !cli.stdin && !cli.no_siblings && cfg.general.open_siblings,
+                sort: cli.sort.unwrap_or(cfg.general.sort),
+                reverse: cli.reverse || cfg.general.reverse,
+            },
+        )
+    };
     log::debug!(
         "scanned {} files ({} to sniff) in {:.1?}",
         scan.files.len(),
@@ -104,6 +131,23 @@ fn main() -> anyhow::Result<()> {
             }
         });
     }
+    let server = {
+        let proxy = proxy.clone();
+        let proxy = std::sync::Mutex::new(proxy);
+        match ipc::serve(move |inc| {
+            let proxy = proxy.lock().unwrap_or_else(|e| e.into_inner());
+            proxy.send_event(UserEvent::Ipc(inc)).is_ok()
+        }) {
+            Ok(s) => {
+                log::debug!("IPC socket {}", s.path().display());
+                Some(s)
+            }
+            Err(e) => {
+                log::warn!("IPC socket: {e}");
+                None
+            }
+        }
+    };
     let watch = {
         let proxy = proxy.clone();
         config::watch::spawn(cli.config.clone(), loaded.watch.clone(), move |r| {
@@ -117,16 +161,42 @@ fn main() -> anyhow::Result<()> {
         class: cli.class.unwrap_or_else(|| cfg.window.class.clone()),
         overrides,
         private: cli.private,
+        socket: server.as_ref().map(|s| s.path().to_path_buf()),
     };
     let mut app = App::new(opts, state, proxy, loaded, watch);
     if let Some(e) = config_error {
         app.config_failed(&e);
     }
     event_loop.run_app(&mut app)?;
+    if cli.print_marked
+        && let Some(marked) = app.marked_output()
+    {
+        let sep = if cli.null { b'\0' } else { b'\n' };
+        let mut out = std::io::stdout().lock();
+        for p in marked {
+            out.write_all(p.as_os_str().as_bytes())?;
+            out.write_all(&[sep])?;
+        }
+        out.flush()?;
+    }
+    // Lets in-flight IPC replies (to a `quit`, say) go out, then removes the socket.
+    drop(server);
     match app.error.take() {
         Some(e) => Err(e),
         None => Ok(()),
     }
+}
+
+/// `-i`: paths from stdin, one per line (NUL-separated with `-0`).
+fn read_stdin_paths(null: bool) -> anyhow::Result<Vec<PathBuf>> {
+    let mut buf = Vec::new();
+    std::io::stdin().lock().read_to_end(&mut buf)?;
+    let sep = if null { 0 } else { b'\n' };
+    Ok(buf
+        .split(|b| *b == sep)
+        .filter(|l| !l.is_empty())
+        .map(|l| PathBuf::from(OsString::from_vec(l.to_vec())))
+        .collect())
 }
 
 /// `--check-config`: report and exit, non-zero on errors.

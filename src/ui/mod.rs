@@ -11,7 +11,7 @@ use crate::render::image::AlphaStyle;
 use crate::render::prims::Prim;
 use crate::render::text::{Align, FontRole, TextItem};
 use crate::render::{ImageDraw, Scene};
-use crate::state::{AlphaBg, AppState, GRID_NAME_SIZE, Mode, MsgKind, ThumbState};
+use crate::state::{AlphaBg, AppState, BAR_HEIGHT, GRID_NAME_SIZE, Mode, MsgKind, ThumbState};
 
 /// Space Mono label tracking.
 const LABEL_TRACKING: f32 = 0.08;
@@ -71,6 +71,10 @@ pub fn scene<'a>(
         empty_state(&mut scene, theme, sf, [w, h - bar_h]);
     }
     if bar_h > 0.0 {
+        status_bar(&mut scene, state, theme, now, [w, h], bar_h, measure);
+    } else if state.prompt.is_some() {
+        // A question can't hide with the bar: it overlays the image until answered.
+        let bar_h = (BAR_HEIGHT * sf).round();
         status_bar(&mut scene, state, theme, now, [w, h], bar_h, measure);
     }
     scene
@@ -259,6 +263,16 @@ fn status_bar(
     if !state.pending.is_empty() {
         spans.push((state.pending.clone(), theme.text_disabled));
     }
+    if let Some((_, name)) = state.running.last() {
+        let more = match state.running.len() {
+            1 => String::new(),
+            n => format!(" +{}", n - 1),
+        };
+        spans.push((
+            format!("[RUNNING {}{more}]", name.to_uppercase()),
+            theme.text_secondary,
+        ));
+    }
     if let Some(m) = &state.message {
         let color = if m.kind == MsgKind::Error {
             theme.accent
@@ -342,6 +356,18 @@ fn status_bar(
         };
         scene.prims.push(dot);
         right_w += gap + count_w + 6.0 * sf + 2.0 * r;
+    }
+
+    // A pending question takes the filename's place: `DELETE 3 FILES?  Y / N`.
+    if let Some(q) = &state.prompt {
+        let mut item = label("", theme.text_display, sf, pad, y, Align::Left);
+        item.spans = vec![
+            (format!("{}  ", q.to_uppercase()), theme.text_display),
+            ("Y / N".into(), theme.text_secondary),
+        ];
+        item.max_width = Some((w - 2.0 * pad - right_w - 32.0 * sf).max(0.0));
+        scene.texts.push(item);
+        return;
     }
 
     // The filename takes whatever the right side leaves, ellipsised in the middle.

@@ -178,16 +178,25 @@ preset = "nothing-dark"   # nothing-dark | nothing-light
 #
 # [commands.copy]
 # desc = "Copy image"
-# run = "wl-copy --type image/png < {file}" # string: sh -c, placeholders shell-quoted
+# run = "wl-copy --type image/png < {file}" # string: sh -c, placeholders shell-quoted for you
 #
 # [commands.delete]
 # desc = "Delete files"
 # run = ["rm", "--", "{files}"]
-# confirm = "Delete {count} file(s)?"
+# confirm = "Delete {count} file(s)?"      # asks inline; y runs it, any other key cancels
 #
-# Fields: targets = auto | current | marked | all, stdin = none | files | files0,
-# output = status | actions | ignore, after = actions run on success (default "refresh").
-# Placeholders: {file} {files} {dir} {name} {stem} {ext} {index} {count} {width} {height}.
+# [commands.legacy]                         # an nsxiv key-handler works unchanged
+# run = ["~/.config/nsxiv/exec/key-handler", "w"]
+# stdin = "files"
+#
+# Fields: targets = auto (marked, else current) | current | marked | all,
+# stdin = none | files | files0, output = status (last stdout line) | actions (each line runs
+# as an action) | ignore, after = actions run on success (default "refresh": drop deleted
+# files, reload changed ones).
+# Placeholders: {file} {dir} {name} {stem} {ext} {index} {width} {height} describe the current
+# image; {files} and {count} the targets. In an array, an element containing {files} repeats
+# once per target. Commands also see $REMAGE_FILE $REMAGE_INDEX $REMAGE_COUNT $REMAGE_MODE
+# $REMAGE_SOCKET $REMAGE_PID. In a binding array, actions after a `run` wait for it to succeed.
 [commands]
 
 # External decoders for anything else; they write PNG, PPM or TIFF to stdout.

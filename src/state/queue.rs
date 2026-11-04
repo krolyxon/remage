@@ -31,6 +31,8 @@ pub struct Queue {
     index: usize,
     /// Marked files, by path so reordering keeps them.
     marks: HashSet<PathBuf>,
+    /// Bumped on every change to the marks, so watchers can spot one.
+    marks_version: u64,
 }
 
 impl Queue {
@@ -43,6 +45,7 @@ impl Queue {
             files,
             index: 0,
             marks: HashSet::new(),
+            marks_version: 0,
         };
         q.index = q.clamp(index);
         q
@@ -97,7 +100,9 @@ impl Queue {
             return false;
         };
         let removed = self.files.remove(i);
-        self.marks.remove(&removed);
+        if self.marks.remove(&removed) {
+            self.marks_version += 1;
+        }
         if i < self.index {
             self.index -= 1;
         }
@@ -186,27 +191,36 @@ impl Queue {
         self.marks.len()
     }
 
+    pub fn marks_version(&self) -> u64 {
+        self.marks_version
+    }
+
     /// Mark or unmark file `i`. Returns whether anything changed.
     pub fn set_mark(&mut self, i: usize, on: bool) -> bool {
         let Some(f) = self.files.get(i) else {
             return false;
         };
-        if on {
+        let changed = if on {
             self.marks.insert(f.clone())
         } else {
             self.marks.remove(f)
-        }
+        };
+        self.marks_version += changed as u64;
+        changed
     }
 
     pub fn mark_all(&mut self) {
         self.marks = self.files.iter().cloned().collect();
+        self.marks_version += 1;
     }
 
     pub fn unmark_all(&mut self) {
         self.marks.clear();
+        self.marks_version += 1;
     }
 
     pub fn invert_marks(&mut self) {
+        self.marks_version += 1;
         self.marks = self
             .files
             .iter()
@@ -216,7 +230,6 @@ impl Queue {
     }
 
     /// Marked files in queue order.
-    #[allow(dead_code)] // `-o` and command targets arrive in M4
     pub fn marked(&self) -> Vec<&Path> {
         self.files
             .iter()
@@ -442,7 +455,9 @@ mod tests {
         let mut q = Queue::new(paths(&["a", "b", "c", "d"]), None, 0);
         assert!(q.set_mark(1, true));
         assert!(q.set_mark(3, true));
+        let v = q.marks_version();
         assert!(!q.set_mark(3, true));
+        assert_eq!(q.marks_version(), v);
         assert_eq!(q.marked_count(), 2);
         q.reverse();
         assert!(q.is_marked(0) && q.is_marked(2));

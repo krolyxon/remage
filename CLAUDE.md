@@ -268,12 +268,19 @@ stdin = "files"
 
 **Command fields:**
 - **Placeholders:** `{file} {files} {dir} {name} {stem} {ext} {index} {count} {width} {height}`.
+  `{file}`, `{dir}`, `{name}`, `{stem}`, `{ext}`, `{index}`, `{width}` and `{height}` describe the
+  current image; `{files}` and `{count}` (and `REMAGE_COUNT`) describe the targets. Only these
+  names are substituted, so `awk '{print $1}'` survives. In an exec array, an element containing
+  `{files}` repeats once per target (`--in={files}` → `--in=a --in=b`), and a leading `~/` in the
+  template expands. In a shell string every value is shell-quoted, so don't quote placeholders.
+  A command that mentions file placeholders (or reads stdin) refuses to run with no targets.
 - **`targets`:** `auto` (marked files if any, otherwise the current one; the default), `current`,
   `marked` or `all`.
 - **`stdin`:** `none`, `files` (newline-separated) or `files0` (NUL-separated).
 - **Environment:** `REMAGE_FILE`, `REMAGE_INDEX`, `REMAGE_COUNT`, `REMAGE_MODE`, `REMAGE_SOCKET`,
   `REMAGE_PID`.
-- **`confirm`:** turns the command into an inline y/n prompt. remage has no modal dialogs.
+- **`confirm`:** turns the command into an inline y/n prompt. remage has no modal dialogs. `y`
+  runs it and any other key (or `cancel`) drops it. The prompt shows even with the bar hidden.
 - **`output`:**
   - `status` (default): the last stdout line goes to the status line.
   - `actions`: every stdout line is run as an action.
@@ -282,7 +289,10 @@ stdin = "files"
   or `[ERROR: <code> <first stderr line>]`.
 - **`after`:** actions to run on success. The default is `refresh`, which re-stats the targets,
   drops missing files and re-decodes changed ones. That way delete and rotate scripts work with no
-  extra setup.
+  extra setup. "Changed" means the mtime differs from the one recorded when the file was decoded
+  or thumbnailed. A bare `refresh` (key, IPC) re-checks the whole queue.
+- **Chains:** in a binding array, the actions after a `run` (and the command's `after`) wait for
+  it to exit successfully; a failure or a declined prompt drops the rest.
 - **Unbound commands** still appear in the `:` palette.
 
 **IPC socket.** It lives at `$XDG_RUNTIME_DIR/remage/<pid>.sock` and speaks newline-delimited JSON.
@@ -293,6 +303,12 @@ stdin = "files"
 - **Replies:** `{"ok":true,"data":…}` or `{"ok":false,"error":"…"}`.
 - **Client:** `remage msg <action>`, `remage msg --query marked` and `remage msg --subscribe image`.
   It targets `$REMAGE_SOCKET`, otherwise the newest instance; `--pid` picks one explicitly.
+  Strings and string lists print one per line, anything else as JSON; errors go to stderr with
+  exit 1. Subscriptions print one JSON event per line.
+- **Details:** `"action"` also takes an array. Events are `image` (`path`, 1-based `index`,
+  `count`), `marks` (`count`, `files`) and `mode`. The socket is 0600 in a 0700 directory,
+  sockets of dead pids are cleaned up at startup, and the socket is removed on exit once any
+  in-flight reply (to a `quit`) has gone out.
 - **Uses:** Hyprland binds, long-running watchers and other tools driving the viewer.
 
 ### Config
@@ -460,7 +476,7 @@ Each milestone should end with a usable binary.
 - **M3 Grid + marks** ✓ (2026-11-04). Cached grid opens in ~85 ms, 0% CPU when idle.
   - Freedesktop thumbnails, worker priorities and the GPU atlas.
   - Grid navigation, visual mode, marks and smooth scrolling.
-- **M4 Commands + IPC**
+- **M4 Commands + IPC** ✓ (2026-11-04). Tested end to end over the socket and with `wtype`.
   - `[commands]` with async exec, confirm, output modes and `after`/`refresh`.
   - The socket, `remage msg` and subscriptions; `-i`/`-o`/`-0`.
 - **M5 Formats + fidelity**
