@@ -1,0 +1,59 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  release:
+    name: build and publish
+    runs-on: ubuntu-latest
+    # Built on Arch: the binary links the system dav1d and libheif, so it suits Arch and other
+    # rolling distros. Elsewhere, build from source.
+    container: archlinux:latest
+    steps:
+      - name: Install system dependencies
+        run: |
+          pacman -Syu --noconfirm --needed base-devel git pkgconf rustup github-cli \
+            dav1d libheif libxkbcommon wayland
+          rustup default stable
+      - uses: actions/checkout@v7
+      - name: Check the tag matches Cargo.toml
+        run: |
+          version="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)"
+          test "v$version" = "$GITHUB_REF_NAME" || { echo "tag $GITHUB_REF_NAME, Cargo.toml $version"; exit 1; }
+      - run: cargo test --locked --release
+      - run: cargo build --locked --release
+      - name: Package
+        run: |
+          name="remage-${GITHUB_REF_NAME}-x86_64-linux"
+          dir="dist/$name"
+          mkdir -p "$dir/completions" "$dir/contrib"
+          install -m755 -s target/release/remage "$dir/"
+          target/release/remage man > "$dir/remage.1"
+          target/release/remage completions zsh > "$dir/completions/_remage"
+          target/release/remage completions bash > "$dir/completions/remage.bash"
+          target/release/remage completions fish > "$dir/completions/remage.fish"
+          cp -r contrib/remage.desktop contrib/config.example.toml contrib/matugen contrib/pywal "$dir/contrib/"
+          cp README.md LICENSE "$dir/"
+          cp assets/fonts/OFL.txt "$dir/OFL-fonts.txt"
+          tar -C dist -czf "dist/$name.tar.gz" "$name"
+          (cd dist && sha256sum "$name.tar.gz" > "$name.tar.gz.sha256")
+      - name: Release notes from CHANGELOG.md
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          awk -v v="$version" '/^## /{p = index($0, "[" v "]") > 0; next} p' CHANGELOG.md > notes.md
+          test -s notes.md || { echo "no CHANGELOG.md section for $version"; exit 1; }
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          gh release create "$GITHUB_REF_NAME" --title "remage $GITHUB_REF_NAME" \
+            --notes-file notes.md dist/*.tar.gz dist/*.sha256

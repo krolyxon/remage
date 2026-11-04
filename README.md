@@ -3,6 +3,8 @@
   <p>A keyboard-centric image viewer for Linux. Fast, quiet and vim-shaped.</p>
 
 [![CI](https://img.shields.io/github/actions/workflow/status/krolyxon/remage/ci.yml?branch=master&style=flat-square&label=CI&labelColor=000000)](https://github.com/krolyxon/remage/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/krolyxon/remage?style=flat-square&label=release&labelColor=000000&color=333333)](https://github.com/krolyxon/remage/releases/latest)
+[![Downloads](https://img.shields.io/github/downloads/krolyxon/remage/total?style=flat-square&labelColor=000000&color=333333)](https://github.com/krolyxon/remage/releases)
 [![Top language](https://img.shields.io/github/languages/top/krolyxon/remage?style=flat-square&logo=rust&logoColor=white&labelColor=000000&color=333333)](https://github.com/krolyxon/remage)
 [![Lines of code](https://img.shields.io/badge/lines%20of%20code-17.5k-333333?style=flat-square&labelColor=000000)](src)
 [![License](https://img.shields.io/github/license/krolyxon/remage?style=flat-square&labelColor=000000&color=333333)](LICENSE)
@@ -57,6 +59,22 @@ it with plain shell commands and an IPC socket.
   suggestions.
 
 ## Install
+
+### Prebuilt binary
+
+Each [release](https://github.com/krolyxon/remage/releases/latest) has an x86_64 tarball built on
+Arch Linux. It needs `dav1d` and `libheif` installed and suits Arch and other rolling distros; on
+anything else, build from source.
+
+```bash
+v=0.1.0
+curl -LO https://github.com/krolyxon/remage/releases/download/v$v/remage-v$v-x86_64-linux.tar.gz
+tar xf remage-v$v-x86_64-linux.tar.gz && cd remage-v$v-x86_64-linux
+install -Dm755 remage ~/.local/bin/remage
+install -Dm644 remage.1 ~/.local/share/man/man1/remage.1
+```
+
+The tarball also holds zsh/bash/fish completions, the desktop file and the example config.
 
 ### Arch Linux
 
@@ -210,6 +228,10 @@ REMAGE_SNAPSHOT=/tmp/x.png remage …          # also write each settled frame t
 ```
 
 `tests/fixtures/make.sh` regenerates the decoder fixtures.
+
+To release, bump `version` in `Cargo.toml`, add a section to [`CHANGELOG.md`](CHANGELOG.md),
+then push a tag: `git tag v0.2.0 && git push origin v0.2.0`. The release workflow builds the
+tarball and publishes the release with that changelog section as its notes.
 
 ## License
 
