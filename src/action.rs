@@ -647,8 +647,65 @@ impl Action {
         }
     }
 
+    /// The help section this action is listed under.
+    pub fn group(&self) -> &'static str {
+        match self {
+            Action::Next(_)
+            | Action::Prev(_)
+            | Action::First
+            | Action::Last
+            | Action::Goto(_)
+            | Action::Random
+            | Action::NextMark
+            | Action::PrevMark => "Navigation",
+            Action::Mark(_) | Action::MarkAll | Action::UnmarkAll | Action::InvertMarks => "Marks",
+            Action::Move(..)
+            | Action::Page(_)
+            | Action::RowStart
+            | Action::RowEnd
+            | Action::Scroll(..)
+            | Action::GridSize(_)
+            | Action::Visual => "Grid",
+            Action::Zoom(_)
+            | Action::Fit(_)
+            | Action::Pan(_)
+            | Action::PanEdge(_)
+            | Action::Center
+            | Action::Rotate(_)
+            | Action::Flip(_)
+            | Action::FilterToggle
+            | Action::AlphaBgCycle
+            | Action::Adjust(..) => "View",
+            Action::Play(_)
+            | Action::NextFrame
+            | Action::PrevFrame
+            | Action::Slideshow(_)
+            | Action::SlideshowDelay { .. } => "Playback",
+            Action::Mode(_)
+            | Action::Fullscreen(_)
+            | Action::Bar(_)
+            | Action::Info(_)
+            | Action::Help
+            | Action::Palette
+            | Action::Search => "Interface",
+            Action::Sort(_)
+            | Action::Reverse
+            | Action::Filter(_)
+            | Action::FilterClear
+            | Action::Remove
+            | Action::Reload
+            | Action::Refresh
+            | Action::Open(_) => "Queue",
+            Action::Run(_)
+            | Action::ReloadConfig
+            | Action::Echo(_)
+            | Action::Cancel
+            | Action::Quit
+            | Action::QuitNoOutput => "App",
+        }
+    }
+
     /// A one-line description of this exact action, for which-key, help and the palette.
-    #[allow(dead_code)] // which-key, help and the palette arrive in M6
     pub fn description(&self) -> String {
         let toggle = |s: &Switch, what: &str| match s {
             Switch::Toggle => format!("Toggle {what}"),
@@ -676,7 +733,14 @@ impl Action {
                 FitMode::Original => "Original size".into(),
             },
             Action::Pan(d) => format!("Pan {}", dir_name(*d)),
-            Action::PanEdge(d) => format!("Jump to {} edge", dir_name(*d)),
+            Action::PanEdge(d) => format!(
+                "Jump to {} edge",
+                match d {
+                    Dir::Up => "top",
+                    Dir::Down => "bottom",
+                    other => dir_name(*other),
+                }
+            ),
             Action::Move(d, _) => format!("Move {}", dir_name(*d)),
             Action::Scroll(d, _) => format!("Scroll {}", dir_name(*d)),
             Action::Page(p) => match p {

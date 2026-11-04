@@ -20,7 +20,7 @@ watch_dir = true          # add and drop files that appear or vanish on disk
 
 [window]
 decorations = false
-title = "{name} — remage" # {name} {index} {count}
+title = "{name} — remage" # placeholders as in ui.statusbar_left
 class = "remage"          # Wayland app_id / X11 class
 fullscreen = false
 
@@ -44,11 +44,17 @@ names = false             # filenames under thumbnails
 
 [ui]
 statusbar = true
-which_key_delay_ms = 300
+which_key_delay_ms = 300   # pending keys wait this long before which-key shows
 scale = 1.0               # UI size multiplier on top of the display scale
+# Status bar templates. Placeholders: {name} {path} {dir} {stem} {ext} {format} {width}
+# {height} {zoom} {index} {count} {marked} {frame} {mode} {filter} {info}. Two or more spaces
+# separate segments; a segment whose placeholder is empty right now (no image in the grid,
+# say) drops out.
 statusbar_left = "{name}"
 statusbar_right = "{format}  {width}×{height}  {zoom}%  {index}/{count}"
-info_command = ""         # script whose output fills a status segment
+# Run for each image shown, like nsxiv's image-info: `<command> FILE WIDTH HEIGHT` through
+# sh. Its last stdout line fills {info}, or replaces the left side if no template has {info}.
+info_command = ""
 font_ui = "Space Grotesk"
 font_mono = "Space Mono"
 font_display = "Doto"

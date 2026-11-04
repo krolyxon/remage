@@ -11,6 +11,7 @@ mod heif;
 mod image_rs;
 #[cfg(feature = "jxl")]
 mod jxl;
+pub mod meta;
 #[cfg(feature = "raw")]
 mod raw;
 #[cfg(feature = "svg")]

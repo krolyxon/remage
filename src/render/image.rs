@@ -18,11 +18,15 @@ struct Uniforms {
     bg: [f32; 4],
     dot: [f32; 4],
     params: [f32; 4],
+    /// Gamma, brightness, contrast, and 1 when any differs from neutral.
+    adjust: [f32; 4],
 }
 
-/// How the area behind transparent pixels is painted.
+/// How images are painted: the area behind transparent pixels, and display adjustments.
 #[derive(Clone, Copy, Debug)]
 pub struct AlphaStyle {
+    /// Gamma, brightness, contrast.
+    pub adjust: [f32; 3],
     /// 0 solid, 1 dots, 2 checker.
     pub mode: u32,
     pub bg: [f32; 4],
@@ -435,6 +439,8 @@ impl ImagePipeline {
         alpha: f32,
         style: &AlphaStyle,
     ) {
+        let adjust = style.adjust;
+        let on = adjust != [1.0, 0.0, 1.0];
         let [iw, ih] = [gpu.size[0] as f32, gpu.size[1] as f32];
         let m = affine.m;
         for tile in &gpu.tiles {
@@ -451,6 +457,7 @@ impl ImagePipeline {
                 bg: style.bg,
                 dot: style.dot,
                 params: [alpha, style.mode as f32, style.cell, style.radius],
+                adjust: [adjust[0], adjust[1], adjust[2], on as u32 as f32],
             };
             queue.write_buffer(&tile.uniforms, 0, bytemuck::bytes_of(&u));
         }

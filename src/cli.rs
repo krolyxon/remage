@@ -57,6 +57,16 @@ pub struct Cli {
     #[arg(short = 'b', long)]
     pub no_bar: bool,
 
+    /// Start a slideshow, optionally with this delay: -S=3 (the = keeps paths apart)
+    #[arg(
+        short = 'S',
+        long,
+        value_name = "SECS",
+        num_args = 0..=1,
+        require_equals = true
+    )]
+    pub slideshow: Option<Option<f32>>,
+
     /// How images fit the window
     #[arg(short = 's', long, value_enum, value_name = "MODE")]
     pub fit: Option<FitMode>,
@@ -157,6 +167,18 @@ mod tests {
         assert!(Cli::try_parse_from(["remage", "msg", "--query", "x", "next"]).is_err());
         let c = Cli::try_parse_from(["remage", "-io0", "a.png"]).unwrap();
         assert!(c.stdin && c.print_marked && c.null && c.command.is_none());
+    }
+
+    #[test]
+    fn slideshow_seconds_need_an_equals() {
+        let c = Cli::try_parse_from(["remage", "-S", "pics"]).unwrap();
+        assert_eq!(c.slideshow, Some(None));
+        assert_eq!(c.paths, [PathBuf::from("pics")]);
+        let c = Cli::try_parse_from(["remage", "-S=2.5", "pics"]).unwrap();
+        assert_eq!(c.slideshow, Some(Some(2.5)));
+        let c = Cli::try_parse_from(["remage", "--slideshow=3"]).unwrap();
+        assert_eq!(c.slideshow, Some(Some(3.0)));
+        assert_eq!(Cli::try_parse_from(["remage"]).unwrap().slideshow, None);
     }
 
     #[test]

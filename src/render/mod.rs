@@ -41,6 +41,9 @@ pub struct Scene<'a> {
     pub under: Vec<Prim>,
     pub prims: Vec<Prim>,
     pub texts: Vec<TextItem>,
+    /// Panels (palette, help, info, which-key) and their text, above everything else.
+    pub overlay_prims: Vec<Prim>,
+    pub overlay_texts: Vec<TextItem>,
 }
 
 pub struct Renderer {
@@ -305,12 +308,15 @@ impl Renderer {
         self.prims.prepare(
             &self.device,
             &self.queue,
-            &scene.under,
-            &scene.prims,
+            [&scene.under, &scene.prims, &scene.overlay_prims],
             viewport,
         );
-        self.text
-            .prepare(&self.device, &self.queue, &scene.texts, size)?;
+        self.text.prepare(
+            &self.device,
+            &self.queue,
+            [&scene.texts, &scene.overlay_texts],
+            size,
+        )?;
 
         let mut encoder = self
             .device
@@ -351,6 +357,8 @@ impl Renderer {
             }
             self.prims.draw_over(&mut pass);
             self.text.render(&mut pass)?;
+            self.prims.draw_overlay(&mut pass);
+            self.text.render_overlay(&mut pass)?;
         }
         Ok(encoder.finish())
     }

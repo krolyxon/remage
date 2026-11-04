@@ -104,6 +104,8 @@ pub struct TextSystem {
     cache: Cache,
     atlas: TextAtlas,
     renderer: TextRenderer,
+    /// Text above overlay panels, sharing the atlas.
+    overlay: TextRenderer,
     viewport: Viewport,
     format: wgpu::TextureFormat,
     shaped: HashMap<Key, Shaped>,
@@ -146,6 +148,8 @@ impl TextSystem {
         let mut atlas = TextAtlas::new(device, queue, &cache, format);
         let renderer =
             TextRenderer::new(&mut atlas, device, wgpu::MultisampleState::default(), None);
+        let overlay =
+            TextRenderer::new(&mut atlas, device, wgpu::MultisampleState::default(), None);
         let viewport = Viewport::new(device, &cache);
         Self {
             fonts,
@@ -153,6 +157,7 @@ impl TextSystem {
             cache,
             atlas,
             renderer,
+            overlay,
             viewport,
             format,
             shaped: HashMap::new(),
@@ -173,6 +178,12 @@ impl TextSystem {
         self.swash = SwashCache::new();
         self.atlas = TextAtlas::new(device, queue, &self.cache, self.format);
         self.renderer = TextRenderer::new(
+            &mut self.atlas,
+            device,
+            wgpu::MultisampleState::default(),
+            None,
+        );
+        self.overlay = TextRenderer::new(
             &mut self.atlas,
             device,
             wgpu::MultisampleState::default(),
@@ -234,15 +245,15 @@ impl TextSystem {
         self.shaped.get(&key).map_or(0.0, |s| s.width)
     }
 
-    /// Shape and upload this frame's text.
+    /// Shape and upload this frame's text: the base layer and the overlay layer.
     pub fn prepare(
         &mut self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
-        items: &[TextItem],
+        layers: [&[TextItem]; 2],
         size: [u32; 2],
     ) -> anyhow::Result<()> {
-        let keys: Vec<Key> = items.iter().map(|i| self.shape(i)).collect();
+        let keys: [Vec<Key>; 2] = layers.map(|l| l.iter().map(|i| self.shape(i)).collect());
         // Keep what this frame (including any `measure` calls) used, and reset for the next.
         self.shaped.retain(|_, s| std::mem::take(&mut s.used));
         self.viewport.update(
@@ -252,8 +263,21 @@ impl TextSystem {
                 height: size[1],
             },
         );
+        for (layer, (items, keys)) in layers.iter().zip(&keys).enumerate() {
+            self.prepare_layer(device, queue, layer, items, keys)?;
+        }
+        Ok(())
+    }
 
-        let areas = items.iter().zip(&keys).filter_map(|(item, key)| {
+    fn prepare_layer(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        layer: usize,
+        items: &[TextItem],
+        keys: &[Key],
+    ) -> anyhow::Result<()> {
+        let areas = items.iter().zip(keys).filter_map(|(item, key)| {
             let s = self.shaped.get(key)?;
             let width = s.width;
             let left = match item.align {
@@ -290,7 +314,12 @@ impl TextSystem {
                 custom_glyphs: &[],
             })
         });
-        self.renderer.prepare(
+        let renderer = if layer == 0 {
+            &mut self.renderer
+        } else {
+            &mut self.overlay
+        };
+        renderer.prepare(
             device,
             queue,
             &mut self.fonts,
@@ -304,6 +333,11 @@ impl TextSystem {
 
     pub fn render(&self, pass: &mut wgpu::RenderPass<'_>) -> anyhow::Result<()> {
         self.renderer.render(&self.atlas, &self.viewport, pass)?;
+        Ok(())
+    }
+
+    pub fn render_overlay(&self, pass: &mut wgpu::RenderPass<'_>) -> anyhow::Result<()> {
+        self.overlay.render(&self.atlas, &self.viewport, pass)?;
         Ok(())
     }
 

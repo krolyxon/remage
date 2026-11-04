@@ -36,7 +36,6 @@ impl Run {
 }
 
 /// A next key that would continue the pending sequence.
-#[allow(dead_code)] // which-key arrives in M6
 #[derive(Clone, Debug, PartialEq)]
 pub struct Candidate {
     pub key: Key,
@@ -209,9 +208,13 @@ impl Keymap {
     }
 
     /// A key sequence (not a count) is waiting for more keys.
-    #[allow(dead_code)] // which-key arrives in M6
     pub fn is_pending(&self) -> bool {
         !self.pending.is_empty()
+    }
+
+    /// The keys of the pending sequence.
+    pub fn pending_keys(&self) -> &[Key] {
+        &self.pending
     }
 
     pub fn cancel(&mut self) {
@@ -234,7 +237,6 @@ impl Keymap {
     }
 
     /// The keys that continue the pending sequence, for which-key.
-    #[allow(dead_code)] // which-key arrives in M6
     pub fn candidates(&self, mode: Mode) -> Vec<Candidate> {
         let Some(node) = self.root(mode).walk(&self.pending) else {
             return Vec::new();
@@ -257,7 +259,6 @@ impl Keymap {
     }
 
     /// The sequences bound to exactly `action` in a mode, shortest first.
-    #[allow(dead_code)] // the palette and help arrive in M6
     pub fn keys_for(&self, mode: Mode, action: &Action) -> Vec<KeySeq> {
         let mut keys: Vec<KeySeq> = self
             .bindings(mode)

@@ -9,6 +9,8 @@ struct Uniforms {
     dot_color: vec4<f32>,
     // x: opacity, y: alpha-bg mode (0 solid, 1 dots, 2 checker), z: cell px, w: dot radius px
     params: vec4<f32>,
+    // x: gamma, y: brightness, z: contrast, w: 1 when any is not neutral
+    adjust: vec4<f32>,
 };
 
 @group(0) @binding(0) var<uniform> u: Uniforms;
@@ -36,7 +38,14 @@ fn vs(@builtin(vertex_index) i: u32) -> VOut {
 
 @fragment
 fn fs(in: VOut) -> @location(0) vec4<f32> {
-    let c = textureSample(tex, samp, in.uv);
+    var c = textureSample(tex, samp, in.uv);
+    if u.adjust.w > 0.5 {
+        // Adjust in display (sRGB-ish) space, as viewers do, then back to linear.
+        var v = pow(max(c.rgb, vec3(0.0)), vec3(1.0 / 2.2));
+        v = (v - 0.5) * u.adjust.z + 0.5 + u.adjust.y;
+        v = pow(clamp(v, vec3(0.0), vec3(1.0)), vec3(1.0 / u.adjust.x));
+        c = vec4(pow(v, vec3(2.2)), c.a);
+    }
     var bg = u.bg.rgb;
     let mode = u32(u.params.y);
     let cell = u.params.z;

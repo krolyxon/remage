@@ -14,22 +14,25 @@ use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoopProxy};
 use winit::keyboard::{ModifiersState, PhysicalKey};
 use winit::window::{Fullscreen, Window, WindowId};
 
-use crate::action::{Action, ModeArg, Switch, Zoom};
+use crate::action::{Action, CATALOG, ModeArg, Switch, Zoom};
 use crate::cache::ImageCache;
 use crate::config::watch::ConfigWatch;
 use crate::config::{Config, LoadError, Loaded, Output, Targets, suggest};
 use crate::decode::{self, DecodedImage};
 use crate::exec;
 use crate::input::keymap::{KeyTables, Keymap};
-use crate::input::keys::{Key, Scroll};
+use crate::input::keys::{Code, Key, KeySeq, Named, Scroll};
 use crate::input::{self};
 use crate::ipc::{self, Query, Request, Topic};
 use crate::render::{Renderer, text};
 use crate::scan;
+use crate::state::overlay::{Edit, Help, HelpRow, Info, InputKind, PaletteItem, WhichRow};
+use crate::state::queue::Queue;
 use crate::state::view::{Dir, FitMode};
 use crate::state::{AppState, Effects, Mode, MsgKind, Settings};
 use crate::thumbs::{self, CacheOptions, Thumb, ThumbError};
 use crate::ui;
+use crate::watch::{self, DirWatch};
 use crate::worker::{JobKey, Pool, Priority};
 
 /// GPU upload budget per event-loop turn, so preloads never cause a hitch.
@@ -86,6 +89,14 @@ pub enum UserEvent {
     Refreshed(Vec<(PathBuf, Option<SystemTime>)>),
     /// A request on the IPC socket.
     Ipc(ipc::Incoming),
+    /// Metadata for the info panel.
+    Info(Info),
+    /// The last line `ui.info_command` printed for a file.
+    InfoLine { path: PathBuf, line: String },
+    /// Files appeared, changed or vanished in a watched directory.
+    Dir(watch::Changes),
+    /// `open <path>` finished scanning.
+    Opened { arg: PathBuf, scan: scan::Scan },
 }
 
 /// Command-line settings that beat the config, across reloads too.
@@ -94,10 +105,14 @@ pub struct Overrides {
     pub fit: Option<FitMode>,
     pub zoom: Option<f32>,
     pub bar: Option<bool>,
+    pub slideshow_delay: Option<Duration>,
 }
 
 impl Overrides {
     pub fn apply(&self, s: &mut Settings) {
+        if let Some(d) = self.slideshow_delay {
+            s.slideshow_delay = d;
+        }
         if let Some(fit) = self.fit {
             s.fit = fit;
         }
@@ -116,6 +131,8 @@ pub struct Options {
     pub private: bool,
     /// The IPC socket, passed to commands as `$REMAGE_SOCKET`.
     pub socket: Option<PathBuf>,
+    /// Directories the queue came from, for `watch_dir`.
+    pub dirs: Vec<(PathBuf, bool)>,
 }
 
 /// Where a chain of actions came from, which decides what some of them act on.
@@ -224,6 +241,14 @@ pub struct App {
     refine_failed: HashSet<PathBuf>,
     /// `quit-no-output` ran: `-o` prints nothing.
     no_output: bool,
+    /// When the pending key sequence started waiting, for which-key.
+    which_key_since: Option<Instant>,
+    /// Watches the queue's directories while `watch_dir` is on.
+    dir_watch: Option<DirWatch>,
+    /// The file whose metadata is being read for the info panel.
+    info_loading: Option<PathBuf>,
+    /// The file `ui.info_command` last ran for.
+    info_line_for: Option<PathBuf>,
     pub error: Option<anyhow::Error>,
 }
 
@@ -275,8 +300,13 @@ impl App {
             refining: None,
             refine_failed: HashSet::new(),
             no_output: false,
+            which_key_since: None,
+            dir_watch: None,
+            info_loading: None,
+            info_line_for: None,
             error: None,
         };
+        app.set_dir_watch();
         // Decode the first image while the window and GPU come up.
         app.sync(true);
         app
@@ -427,6 +457,7 @@ impl App {
         }
         let wanted = self.window_paths();
         self.update_title();
+        self.request_info();
         let Some(cur) = wanted.first().cloned() else {
             self.state.clear_shown();
             self.uploads.clear();
@@ -618,24 +649,363 @@ impl App {
         self.uploads.retain(|(p, _)| p != path);
         self.state.show(path, img.source_size, img.format, now);
         self.state.set_frames(img.delays(), img.animated, now);
+        self.request_info_line();
         self.request_redraw();
     }
 
     fn update_title(&self) {
         if let Some(g) = &self.gfx {
-            let q = &self.state.queue;
-            let title = match q.current() {
-                Some(p) => self
-                    .config
-                    .window
-                    .title
-                    .replace("{name}", &ui::file_name(p))
-                    .replace("{index}", &(q.index() + 1).to_string())
-                    .replace("{count}", &q.len().to_string()),
+            let title = match self.state.queue.current() {
+                Some(_) => {
+                    ui::template::expand(&self.config.window.title, &|n| ui::var(&self.state, n))
+                }
                 None => "remage".into(),
             };
             g.window.set_title(&title);
         }
+    }
+
+    /// Start, retarget or stop the directory watch to match `watch_dir` and the queue.
+    fn set_dir_watch(&mut self) {
+        let dirs = if self.config.general.watch_dir {
+            self.opts.dirs.clone()
+        } else {
+            Vec::new()
+        };
+        match &self.dir_watch {
+            Some(w) => w.set(dirs),
+            None if !dirs.is_empty() => {
+                let proxy = self.proxy.clone();
+                self.dir_watch = Some(watch::spawn(dirs, move |c| {
+                    let _ = proxy.send_event(UserEvent::Dir(c));
+                }));
+            }
+            None => {}
+        }
+    }
+
+    /// Files changed on disk: new images join the queue, changed ones reload, gone ones leave.
+    fn on_dir(&mut self, c: watch::Changes) {
+        let known: HashSet<&PathBuf> = self.state.queue.all_files().iter().collect();
+        let (old, new): (Vec<_>, Vec<_>) =
+            c.present.into_iter().partition(|(p, _)| known.contains(p));
+        let mut found: Vec<(PathBuf, Option<SystemTime>)> =
+            old.into_iter().map(|(p, t)| (p, Some(t))).collect();
+        found.extend(c.gone.into_iter().map(|p| (p, None)));
+        if !found.is_empty() {
+            self.on_refreshed(found);
+        }
+        if !new.is_empty() {
+            log::debug!("{} new files on disk", new.len());
+            let was_empty = self.state.queue.is_empty();
+            self.state
+                .queue
+                .insert_sorted(new.into_iter().map(|(p, _)| p));
+            self.sync(was_empty);
+        }
+    }
+
+    /// `open <path>`: a file already queued is just selected; anything else is scanned
+    /// (with its siblings) off-thread and replaces the queue.
+    fn open(&mut self, arg: &str) {
+        let cwd = std::env::current_dir().unwrap_or_default();
+        let path = crate::config::expand_path(arg, &cwd);
+        if let Some(i) = self.state.queue.files().iter().position(|f| *f == path) {
+            let fx = self.state.apply(Action::Goto(i + 1), Instant::now());
+            if fx.navigated {
+                self.sync(true);
+            }
+            return;
+        }
+        let g = &self.config.general;
+        let opts = scan::ScanOptions {
+            recursive: g.recursive,
+            siblings: g.open_siblings,
+            sort: g.sort,
+            reverse: g.reverse,
+        };
+        let proxy = self.proxy.clone();
+        std::thread::spawn(move || {
+            let scan = scan::scan(std::slice::from_ref(&path), &opts);
+            let _ = proxy.send_event(UserEvent::Opened { arg: path, scan });
+        });
+    }
+
+    fn on_opened(&mut self, arg: PathBuf, scan: scan::Scan) {
+        let now = Instant::now();
+        if scan.files.is_empty() && scan.unknown.is_empty() {
+            let why = scan
+                .errors
+                .first()
+                .cloned()
+                .unwrap_or_else(|| format!("{}: no images", arg.display()));
+            self.state
+                .notify(format!("error: {why}"), MsgKind::Error, now);
+            self.request_redraw();
+            return;
+        }
+        log::debug!("opened {}: {} files", arg.display(), scan.files.len());
+        if !scan.unknown.is_empty() {
+            let proxy = self.proxy.clone();
+            let unknown = scan.unknown;
+            std::thread::spawn(move || {
+                let found: Vec<_> = unknown.into_iter().filter(|p| decode::sniff(p)).collect();
+                if !found.is_empty() {
+                    let _ = proxy.send_event(UserEvent::Found(found));
+                }
+            });
+        }
+        self.state.queue = Queue::new(scan.files, scan.start.as_deref(), 0);
+        self.state.skipped = 0;
+        self.state.input = None;
+        self.opts.dirs = scan.dirs;
+        self.set_dir_watch();
+        if self.state.in_grid() {
+            let l = self.state.grid_layout();
+            self.state
+                .grid
+                .jump_to(l.follow(self.state.queue.index(), 0.0));
+        }
+        self.sync(true);
+    }
+
+    /// Read the current file's metadata for the info panel, off-thread.
+    fn request_info(&mut self) {
+        if !self.state.info_open {
+            return;
+        }
+        let Some(cur) = self.state.queue.current().map(Path::to_path_buf) else {
+            return;
+        };
+        if self.state.info.as_ref().is_some_and(|i| i.path == cur)
+            || self.info_loading.as_ref() == Some(&cur)
+        {
+            return;
+        }
+        self.info_loading = Some(cur.clone());
+        let proxy = self.proxy.clone();
+        std::thread::spawn(move || {
+            let rows = decode::meta::read(&cur);
+            let _ = proxy.send_event(UserEvent::Info(Info { path: cur, rows }));
+        });
+    }
+
+    /// Run `ui.info_command` for the image on screen (nsxiv's image-info: file, width,
+    /// height); its last line fills `{info}`.
+    fn request_info_line(&mut self) {
+        let cmd = self.config.ui.info_command.trim();
+        let Some(shown) = &self.state.shown else {
+            return;
+        };
+        if cmd.is_empty() || self.info_line_for.as_ref() == Some(&shown.path) {
+            return;
+        }
+        let path = shown.path.clone();
+        self.info_line_for = Some(path.clone());
+        let mut c = std::process::Command::new("sh");
+        c.arg("-c")
+            .arg(format!("{cmd} \"$@\""))
+            .arg("remage")
+            .arg(&path)
+            .arg(shown.size[0].to_string())
+            .arg(shown.size[1].to_string())
+            .stdin(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        if let Some(sock) = &self.opts.socket {
+            c.env("REMAGE_SOCKET", sock);
+        }
+        let proxy = self.proxy.clone();
+        std::thread::spawn(move || {
+            let line = match c.output() {
+                Ok(o) => String::from_utf8_lossy(&o.stdout)
+                    .lines()
+                    .rev()
+                    .find(|l| !l.trim().is_empty())
+                    .unwrap_or("")
+                    .trim()
+                    .to_string(),
+                Err(e) => {
+                    log::warn!("info_command: {e}");
+                    String::new()
+                }
+            };
+            let _ = proxy.send_event(UserEvent::InfoLine { path, line });
+        });
+    }
+
+    /// What a binding does, in a few words: a command's own `desc` for `run`.
+    fn describe(&self, actions: &[Action]) -> String {
+        let one = |a: &Action| match a {
+            Action::Run(name) => self
+                .config
+                .commands
+                .get(name)
+                .map(|c| c.desc.clone())
+                .filter(|d| !d.is_empty())
+                .unwrap_or_else(|| a.description()),
+            _ => a.description(),
+        };
+        actions.iter().map(one).collect::<Vec<_>>().join(" · ")
+    }
+
+    /// The keys bound to exactly `action` in the current mode, keyboard first.
+    fn keys_for(&self, action: &Action) -> String {
+        let mut keys = self.keymap.keys_for(self.state.mode, action);
+        keys.sort_by_key(|k| {
+            k.0.iter()
+                .any(|k| matches!(k.code, Code::Mouse(_) | Code::Scroll(_)))
+        });
+        keys.iter()
+            .take(2)
+            .map(|k| ui::pretty_keys(&k.to_string()))
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    /// Palette rows: user commands, then every action (each argument choice spelled out,
+    /// placeholders like `goto N` left to complete).
+    fn palette_items(&self) -> Vec<PaletteItem> {
+        let mut seen = HashSet::new();
+        let mut items = Vec::new();
+        let mut push = |items: &mut Vec<PaletteItem>,
+                        action: String,
+                        desc: String,
+                        keys: String,
+                        template: bool| {
+            if seen.insert(action.clone()) {
+                items.push(PaletteItem {
+                    action,
+                    desc,
+                    keys,
+                    template,
+                });
+            }
+        };
+        for (name, cmd) in &self.config.commands {
+            let a = Action::Run(name.clone());
+            let desc = if cmd.desc.is_empty() {
+                format!("Run {name}")
+            } else {
+                cmd.desc.clone()
+            };
+            push(&mut items, a.to_string(), desc, self.keys_for(&a), false);
+        }
+        for entry in CATALOG {
+            if entry.name == "run" {
+                continue;
+            }
+            let args = entry.args.trim_start_matches('[').trim_end_matches(']');
+            // Optional arguments (`[n]`, `[toggle|on|off]`) also offer the bare name.
+            let mut options: Vec<&str> = vec![""];
+            if !entry.args.is_empty() {
+                if !entry.args.starts_with('[') {
+                    options.clear();
+                }
+                options.extend(
+                    args.split('|')
+                        .map(|o| o.trim_end_matches(" [n]").trim_end_matches(']'))
+                        .filter(|o| *o != "n"),
+                );
+            }
+            for opt in options {
+                let text = format!("{} {opt}", entry.name);
+                let required = !entry.args.is_empty() && !entry.args.starts_with('[');
+                let placeholder = opt.contains(['<', 'N']);
+                match text.trim().parse::<Action>() {
+                    Ok(a) if !placeholder => {
+                        let desc = a.description();
+                        push(&mut items, a.to_string(), desc, self.keys_for(&a), false);
+                    }
+                    _ if required || placeholder => {
+                        push(
+                            &mut items,
+                            text.trim().to_string(),
+                            entry.desc.to_string(),
+                            String::new(),
+                            true,
+                        );
+                    }
+                    _ => {}
+                }
+            }
+        }
+        items
+    }
+
+    /// Help rows: the live keymap of the current mode, grouped, keys for one action merged.
+    fn help_rows(&self) -> Vec<HelpRow> {
+        const GROUPS: [&str; 8] = [
+            "Navigation",
+            "Marks",
+            "Grid",
+            "View",
+            "Playback",
+            "Interface",
+            "Queue",
+            "App",
+        ];
+        let rank = |a: &Action| {
+            CATALOG
+                .iter()
+                .position(|e| e.name == a.name())
+                .unwrap_or(usize::MAX)
+        };
+        // (group, catalog rank, action, keys, description)
+        let mut entries: Vec<(usize, usize, String, String, String)> = Vec::new();
+        for (keys, actions) in self.keymap.bindings(self.state.mode) {
+            let Some(first) = actions.first() else {
+                continue;
+            };
+            let group = GROUPS.iter().position(|g| *g == first.group()).unwrap_or(0);
+            let desc = self.describe(&actions);
+            let k = ui::pretty_keys(&keys.to_string());
+            match entries.iter_mut().find(|e| e.0 == group && e.4 == desc) {
+                Some(e) => {
+                    e.3.push_str("  ");
+                    e.3.push_str(&k);
+                }
+                None => entries.push((group, rank(first), first.to_string(), k, desc)),
+            }
+        }
+        // Within a group: catalog order, then by action (`next` before `next 10`).
+        entries.sort_by(|a, b| (a.0, a.1, &a.2).cmp(&(b.0, b.1, &b.2)));
+        let mut rows = Vec::new();
+        let mut last = None;
+        for (group, _, _, keys, desc) in entries {
+            if last != Some(group) {
+                rows.push(HelpRow::Header(GROUPS[group].to_string()));
+                last = Some(group);
+            }
+            rows.push(HelpRow::Binding { keys, desc });
+        }
+        rows
+    }
+
+    /// Which-key rows for the pending sequence.
+    fn which_key_rows(&self) -> Vec<WhichRow> {
+        let mode = self.state.mode;
+        let pending = self.keymap.pending_keys().to_vec();
+        let all = self.keymap.bindings(mode);
+        self.keymap
+            .candidates(mode)
+            .into_iter()
+            .map(|c| {
+                let desc = match &c.actions {
+                    Some(a) => self.describe(a),
+                    None => {
+                        let mut prefix = pending.clone();
+                        prefix.push(c.key);
+                        let n = all.iter().filter(|(k, _)| k.0.starts_with(&prefix)).count();
+                        format!("+{n} more")
+                    }
+                };
+                WhichRow {
+                    key: ui::pretty_keys(&KeySeq(vec![c.key]).to_string()),
+                    desc,
+                    prefix: c.prefix && c.actions.is_none(),
+                }
+            })
+            .collect()
     }
 
     /// Show a config error until the config is fixed.
@@ -666,6 +1036,7 @@ impl App {
         if old.grid.size != new.grid.size {
             self.state.grid.size = new.grid.size;
         }
+        let watch_changed = old.general.watch_dir != new.general.watch_dir;
         if old.grid.thumbnail_cache != new.grid.thumbnail_cache {
             self.thumb_cache = CacheOptions::new(new.grid.thumbnail_cache, self.opts.private);
         }
@@ -695,6 +1066,11 @@ impl App {
             }
             g.renderer.set_font_families(font_families(new));
         }
+        if watch_changed {
+            self.set_dir_watch();
+        }
+        self.info_line_for = None;
+        self.request_info_line();
         self.update_title();
         // Silent on routine changes (a new wallpaper palette); confirm fixes and manual reloads.
         if std::mem::take(&mut self.config_error) || std::mem::take(&mut self.reload_requested) {
@@ -935,7 +1311,7 @@ impl App {
     fn refresh(&mut self, targets: Option<Arc<[PathBuf]>>) {
         let mut files: Vec<PathBuf> = match targets {
             Some(t) => t.to_vec(),
-            None => self.state.queue.files().to_vec(),
+            None => self.state.queue.all_files().to_vec(),
         };
         if let Some(cur) = self.state.queue.current()
             && !files.iter().any(|f| f == cur)
@@ -1059,6 +1435,8 @@ impl App {
                     "bar": s.bar,
                     "fullscreen": fullscreen,
                     "skipped": s.skipped,
+                    "filter": s.queue.filter(),
+                    "slideshow": s.slideshow.is_some(),
                     "running": s.running.iter().map(|(_, n)| n.as_str()).collect::<Vec<_>>(),
                     "pid": std::process::id(),
                 })
@@ -1146,6 +1524,23 @@ impl App {
         if fx.reload {
             self.reload();
         }
+        if fx.palette {
+            let items = self.palette_items();
+            self.keymap.cancel();
+            self.state.open_palette(items);
+        }
+        if fx.help {
+            let rows = self.help_rows();
+            self.state.help = Some(Help { rows, scroll: 0 });
+        }
+        if fx.info {
+            self.request_info();
+        }
+        if fx.open
+            && let Some(p) = self.state.open.take()
+        {
+            self.open(&p);
+        }
         if fx.reload_config {
             self.reload_requested = true;
             self.watch.reload();
@@ -1182,6 +1577,15 @@ impl App {
         if pending != self.state.pending {
             self.state.pending = pending;
             self.request_redraw();
+            if !self.keymap.is_pending() {
+                self.which_key_since = None;
+                self.state.which_key = None;
+            } else if self.state.which_key.is_some() {
+                // Already showing: follow the sequence at once.
+                self.state.which_key = Some(self.which_key_rows());
+            } else {
+                self.which_key_since = Some(now);
+            }
         }
         self.ambiguous_since = self
             .keymap
@@ -1212,6 +1616,18 @@ impl App {
             {
                 self.answer(key == Key::plain('y') || key == Key::plain('Y'));
             }
+            return;
+        }
+        if self.state.input.is_some() {
+            self.on_input_key(&event, event_loop);
+            return;
+        }
+        if self.state.help.is_some()
+            && !event.repeat
+            && let Some(key) = input::key(&event.logical_key, self.modifiers)
+            && !self.keymap.is_pending()
+            && self.help_key(key)
+        {
             return;
         }
         if event.repeat {
@@ -1249,6 +1665,128 @@ impl App {
         }
     }
 
+    /// A key while the palette or search line is open: it edits the line.
+    fn on_input_key(&mut self, event: &winit::event::KeyEvent, el: &ActiveEventLoop) {
+        let now = Instant::now();
+        let Some(key) = input::key(&event.logical_key, self.modifiers) else {
+            return;
+        };
+        let ctrl = |c: char| {
+            Key::new(
+                input::keys::Mods {
+                    ctrl: true,
+                    ..Default::default()
+                },
+                Code::Char(c),
+            )
+        };
+        let named = |n: Named| Key::new(Default::default(), Code::Named(n));
+        let shift_tab = Key::new(
+            input::keys::Mods {
+                shift: true,
+                ..Default::default()
+            },
+            Code::Named(Named::Tab),
+        );
+        let palette = self
+            .state
+            .input
+            .as_ref()
+            .is_some_and(|i| i.kind == InputKind::Palette);
+        let empty = self.state.input.as_ref().is_some_and(|i| i.text.is_empty());
+        let edit = if key == named(Named::Esc) || key == ctrl('c') || key == ctrl('[') {
+            let fx = self.state.input_cancel(now);
+            self.effects(fx, &Ctx::default(), el);
+            return;
+        } else if key == named(Named::Enter) {
+            if event.repeat {
+                return;
+            }
+            let (fx, run) = self.state.input_submit(now);
+            self.effects(fx, &Ctx::default(), el);
+            if let Some(text) = run {
+                match text.parse::<Action>() {
+                    Ok(a) => {
+                        let _ = self.run(vec![a], &Ctx::default(), el);
+                    }
+                    Err(e) => self
+                        .state
+                        .notify(format!("error: {e}"), MsgKind::Error, now),
+                }
+            }
+            self.request_redraw();
+            return;
+        } else if key == named(Named::Backspace) && empty {
+            let fx = self.state.input_cancel(now);
+            self.effects(fx, &Ctx::default(), el);
+            return;
+        } else if key == named(Named::Backspace) || key == ctrl('h') {
+            Edit::Backspace
+        } else if key == ctrl('w') {
+            Edit::DeleteWord
+        } else if key == ctrl('u') {
+            Edit::Clear
+        } else if key == named(Named::Tab) && palette {
+            Edit::Complete
+        } else if key == named(Named::Up) || key == ctrl('p') || key == shift_tab {
+            Edit::Up
+        } else if key == named(Named::Down) || key == ctrl('n') || key == named(Named::Tab) {
+            Edit::Down
+        } else if key == named(Named::Left) {
+            Edit::Left
+        } else if key == named(Named::Right) {
+            Edit::Right
+        } else if key == named(Named::Space) && key.mods.is_empty() {
+            Edit::Insert(" ".into())
+        } else {
+            let m = self.modifiers;
+            match &event.text {
+                Some(t) if !m.control_key() && !m.alt_key() && !m.super_key() => {
+                    Edit::Insert(t.to_string())
+                }
+                _ => return,
+            }
+        };
+        let fx = self.state.input_edit(edit, now);
+        self.effects(fx, &Ctx::default(), el);
+    }
+
+    /// Scrolling and closing keys while help is open. Returns whether the key was used.
+    fn help_key(&mut self, key: Key) -> bool {
+        let page = self.state.help_page();
+        let Some(help) = &mut self.state.help else {
+            return false;
+        };
+        let ctrl = |c: char| {
+            Key::new(
+                input::keys::Mods {
+                    ctrl: true,
+                    ..Default::default()
+                },
+                Code::Char(c),
+            )
+        };
+        let named = |n: Named| Key::new(Default::default(), Code::Named(n));
+        let half = (page / 2).max(1) as isize;
+        let delta = match key {
+            k if k == Key::plain('j') || k == named(Named::Down) => 1,
+            k if k == Key::plain('k') || k == named(Named::Up) => -1,
+            k if k == ctrl('d') || k == ctrl('f') || k == named(Named::PageDown) => half,
+            k if k == ctrl('u') || k == ctrl('b') || k == named(Named::PageUp) => -half,
+            k if k == Key::plain('g') || k == named(Named::Home) => isize::MIN / 2,
+            k if k == Key::plain('G') || k == named(Named::End) => isize::MAX / 2,
+            k if k == Key::plain('q') || k == Key::plain('?') || k == named(Named::Esc) => {
+                self.state.help = None;
+                self.request_redraw();
+                return true;
+            }
+            _ => return false,
+        };
+        help.scroll_by(delta, page);
+        self.request_redraw();
+        true
+    }
+
     /// A mouse button or wheel notch: bound actions run at the cursor, bypassing sequences.
     fn on_mouse_key(&mut self, key: Key, event_loop: &ActiveEventLoop) {
         self.keymap.cancel();
@@ -1267,6 +1805,17 @@ impl App {
     fn on_wheel(&mut self, delta: [f32; 2], pixels: bool, event_loop: &ActiveEventLoop) {
         let now = Instant::now();
         let [dx, dy] = delta;
+        if self.state.help.is_some() {
+            let page = self.state.help_page();
+            self.scroll[1] += dy;
+            let rows = self.scroll[1].trunc();
+            self.scroll[1] -= rows;
+            if let Some(h) = &mut self.state.help {
+                h.scroll_by(-(rows as isize) * 3, page);
+            }
+            self.request_redraw();
+            return;
+        }
         if dy != 0.0 {
             let dir = if dy > 0.0 { Scroll::Up } else { Scroll::Down };
             let key = input::scroll(dir, self.modifiers);
@@ -1578,6 +2127,21 @@ impl ApplicationHandler<UserEvent> for App {
             UserEvent::Command { id, event } => self.on_command(id, event, event_loop),
             UserEvent::Refreshed(found) => self.on_refreshed(found),
             UserEvent::Ipc(inc) => self.on_ipc(inc, event_loop),
+            UserEvent::Info(info) => {
+                if self.info_loading.as_ref() == Some(&info.path) {
+                    self.info_loading = None;
+                }
+                if self.state.queue.current() == Some(info.path.as_path()) {
+                    self.state.info = Some(info);
+                    self.request_redraw();
+                }
+            }
+            UserEvent::InfoLine { path, line } => {
+                self.state.info_line = Some((path, line));
+                self.request_redraw();
+            }
+            UserEvent::Dir(changes) => self.on_dir(changes),
+            UserEvent::Opened { arg, scan } => self.on_opened(arg, scan),
         }
     }
 
@@ -1692,8 +2256,29 @@ impl ApplicationHandler<UserEvent> for App {
                 self.decode(&cur, Priority::Preload);
             }
         }
+        if let Some(t) = self.which_key_since
+            && now >= t + self.state.settings.which_key_delay
+        {
+            self.which_key_since = None;
+            if self.keymap.is_pending() && self.state.input.is_none() {
+                self.state.which_key = Some(self.which_key_rows());
+                self.request_redraw();
+            }
+        }
+        if self.state.slideshow_due(now) {
+            let fx = self.state.apply(Action::Next(1), now);
+            self.state.slideshow_advanced(fx.navigated);
+            if !fx.navigated {
+                self.state.notify("slideshow done", MsgKind::Info, now);
+            }
+            self.effects(fx, &Ctx::default(), event_loop);
+        }
         self.publish();
         let (redraw, mut next) = self.state.tick(now);
+        if let Some(t) = self.which_key_since {
+            let at = t + self.state.settings.which_key_delay;
+            next = Some(next.map_or(at, |n| n.min(at)));
+        }
         if let Some(t) = self.grid_rest {
             let at = t + GRID_REST;
             next = Some(next.map_or(at, |n| n.min(at)));

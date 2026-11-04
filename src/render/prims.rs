@@ -60,9 +60,8 @@ pub struct PrimPipeline {
     bind_group: wgpu::BindGroup,
     instances: wgpu::Buffer,
     capacity: usize,
-    /// Instances of the under layer, then the over layer.
-    split: u32,
-    count: u32,
+    /// Instances of the under, over and overlay layers, in that order: their end offsets.
+    ends: [u32; 3],
 }
 
 const ATTRS: [wgpu::VertexAttribute; 4] =
@@ -147,21 +146,20 @@ impl PrimPipeline {
             bind_group,
             instances: instance_buffer(device, capacity),
             capacity,
-            split: 0,
-            count: 0,
+            ends: [0; 3],
         }
     }
 
-    /// Upload both layers: `under` draws before images and thumbnails, `over` after.
+    /// Upload the layers: `under` draws before images and thumbnails, `over` after them,
+    /// `overlay` after the base layer's text.
     pub fn prepare(
         &mut self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
-        under: &[Prim],
-        over: &[Prim],
+        layers: [&[Prim]; 3],
         viewport: [f32; 2],
     ) {
-        let prims: Vec<Prim> = under.iter().chain(over).copied().collect();
+        let prims: Vec<Prim> = layers.iter().flat_map(|l| l.iter()).copied().collect();
         queue.write_buffer(
             &self.globals,
             0,
@@ -174,8 +172,11 @@ impl PrimPipeline {
         if !prims.is_empty() {
             queue.write_buffer(&self.instances, 0, bytemuck::cast_slice(&prims));
         }
-        self.split = under.len() as u32;
-        self.count = prims.len() as u32;
+        let mut end = 0;
+        for (e, l) in self.ends.iter_mut().zip(layers) {
+            end += l.len() as u32;
+            *e = end;
+        }
     }
 
     fn draw_range(&self, pass: &mut wgpu::RenderPass<'_>, range: std::ops::Range<u32>) {
@@ -189,10 +190,14 @@ impl PrimPipeline {
     }
 
     pub fn draw_under(&self, pass: &mut wgpu::RenderPass<'_>) {
-        self.draw_range(pass, 0..self.split);
+        self.draw_range(pass, 0..self.ends[0]);
     }
 
     pub fn draw_over(&self, pass: &mut wgpu::RenderPass<'_>) {
-        self.draw_range(pass, self.split..self.count);
+        self.draw_range(pass, self.ends[0]..self.ends[1]);
+    }
+
+    pub fn draw_overlay(&self, pass: &mut wgpu::RenderPass<'_>) {
+        self.draw_range(pass, self.ends[1]..self.ends[2]);
     }
 }

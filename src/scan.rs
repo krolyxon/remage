@@ -14,6 +14,8 @@ pub struct Scan {
     /// Files with unrecognised extensions, to sniff in the background.
     pub unknown: Vec<PathBuf>,
     pub errors: Vec<String>,
+    /// Directories listed, and whether recursively: what `watch_dir` watches.
+    pub dirs: Vec<(PathBuf, bool)>,
 }
 
 pub struct ScanOptions {
@@ -38,10 +40,12 @@ pub fn scan(args: &[PathBuf], opts: &ScanOptions) -> Scan {
             list_dir(&path, opts.recursive, &mut files, &mut out.unknown);
             sort(&mut files, opts);
             out.files.extend(files);
+            out.dirs.push((path.clone(), opts.recursive));
         } else if opts.siblings && args.len() == 1 {
             let parent = path.parent().unwrap_or(Path::new("/"));
             let mut files = Vec::new();
             list_dir(parent, false, &mut files, &mut out.unknown);
+            out.dirs.push((parent.to_path_buf(), false));
             out.unknown.retain(|u| *u != path);
             if !files.contains(&path) {
                 files.push(path.clone());

@@ -15,6 +15,7 @@ mod scan;
 mod state;
 mod thumbs;
 mod ui;
+mod watch;
 mod worker;
 
 use std::ffi::OsString;
@@ -103,6 +104,11 @@ fn main() -> anyhow::Result<()> {
         fit: cli.fit,
         zoom: cli.zoom.map(|z| z / 100.0),
         bar: cli.no_bar.then_some(false),
+        slideshow_delay: cli
+            .slideshow
+            .flatten()
+            .filter(|s| s.is_finite() && *s > 0.0)
+            .map(std::time::Duration::from_secs_f32),
     };
     let mut settings = Settings::from_config(cfg);
     overrides.apply(&mut settings);
@@ -116,6 +122,13 @@ fn main() -> anyhow::Result<()> {
     state.theme = loaded.theme.clone();
     state.nearest = cfg.image.filter.nearest();
     state.alpha_bg = cfg.image.alpha_background;
+    if cli.slideshow.is_some() {
+        state.apply(
+            action::Action::Slideshow(action::Switch::On),
+            Instant::now(),
+        );
+        state.message = None;
+    }
     if let Some(err) = scan.errors.first() {
         state.notify(format!("error: {err}"), MsgKind::Error, Instant::now());
     }
@@ -163,6 +176,7 @@ fn main() -> anyhow::Result<()> {
         overrides,
         private: cli.private,
         socket: server.as_ref().map(|s| s.path().to_path_buf()),
+        dirs: scan.dirs,
     };
     let mut app = App::new(opts, state, proxy, loaded, watch);
     if let Some(e) = config_error {
