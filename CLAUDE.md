@@ -178,17 +178,39 @@ The directory listing continues in the background; only the first image is await
   - Writes are atomic (tmp + rename) with mode 0600, and failures go in `fail/remage/`.
   - `-p` disables writing. Because the cache is shared with file managers, thumbnails are often
     already there.
+  - URIs are escaped exactly as GLib's `g_filename_to_uri` escapes them (`!$&'()*+,;=:@` stay
+    literal, hex is uppercase), or the names won't match other tools' entries. A bare path in
+    `Thumb::URI` (ffmpegthumbnailer writes those) also counts as valid.
+  - A `fail/remage/` entry is trusted only if its `Software` is this remage version, so formats a
+    newer version can decode aren't hidden forever.
+  - Images no bigger than the bucket aren't written: re-decoding them costs about as much.
 - **Fast paths:** JPEG uses a DCT-scaled decode (`jpeg-decoder` `Decoder::scale`). RAW uses the
-  embedded preview. Then `fast_image_resize` finishes the job.
-- **Generation and storage:** visible thumbnails are generated first. On the GPU they live in atlas
-  pages with LRU slot eviction.
+  embedded preview. Then `fast_image_resize` finishes the job (Lanczos, premultiplied alpha).
+- **Generation and storage:**
+  - Visible thumbnails are P2. A page above and two pages below are P3. Requests that scroll out of
+    that range are cancelled (`Pool::cancel`).
+  - On the GPU, thumbnails live in 2048² atlas pages at 1:1 pixels, each with a 1 px clear border.
+    The least recently drawn thumbnail outside the prefetch range is evicted first; if every one is
+    in range, the atlas grows a page. A new grid size or scale factor rebuilds the atlas.
+  - Thumbnails fade in over 150 ms. A thumbnail that fails drops the file from the queue (counted in
+    `[SKIPPED n]`), as in image mode.
+- **Cursor:** the grid cursor *is* the queue's current image, so `n`/`p`/`gg`/`G` move it too. The
+  full image decodes only once the cursor has rested 250 ms (`GRID_REST`). That way `<CR>` opens it
+  at once without decoding everything the cursor passes over.
 - **Navigation:** `hjkl`, `gg`/`G`/`[count]G`, `<C-d>`/`<C-u>`, `<C-f>`/`<C-b>` and `0`/`$`.
-  Scrolling animates smoothly, and `+`/`-` steps through `grid.sizes`.
+  Scrolling animates smoothly, and `+`/`-` steps through `grid.sizes`. The wheel scrolls by rows,
+  pixel-exact on touchpads.
+- **Visual mode:** `v` anchors a range and movement extends it. `m` (`mark on`) marks it and returns
+  to the grid; `mark` toggles, unmarking a range that is all marked. `v` or `<Esc>` leaves. The range
+  sits on `surface_raised`, and the bar shows `[VISUAL n]`.
 
 ### Marks
 - `m` toggles a mark, `M` inverts all marks and `u` unmarks everything.
 - `N`/`P` jump to the next/previous marked image.
 - Marks are the default target of user commands, and `-o` prints them on exit.
+- Marks are kept by path, so sorting and reversing keep them.
+- In the status bar, an accent dot plus the count shows the marks. The dot is filled when the
+  current image is marked and a ring when it isn't.
 
 ### Input
 - **Key notation** follows vim: `n`, `G`, `<C-x>`, `<S-Tab>`, `<Space>`, `<BS>`, `<Esc>`, `<CR>`,
@@ -462,7 +484,10 @@ Each milestone should end with a usable binary.
 - **Decoder tests** run against `tests/fixtures/`: dimensions and pixels for each format, EXIF
   orientations 1–8, ICC-tagged images and animated frame counts.
 - **Visual checks without a display:** `REMAGE_SNAPSHOT=/tmp/x.png remage …` renders each settled
-  frame offscreen to a PNG as well. Use it to check the UI when the screen is locked or remote.
+  frame offscreen to a PNG as well. Use it to check the UI when the screen is locked or remote. In
+  the grid, a frame counts as settled once every visible thumbnail is in the atlas. Point
+  `XDG_CACHE_HOME` at a scratch directory to test cold thumbnail generation without touching the
+  real cache.
 - **Before every commit:** `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings` and
   `cargo test`.
 - **Manual smoke test:** run `cargo run --release -- /mnt/media/pix` and check that:
