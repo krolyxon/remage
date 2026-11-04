@@ -12,6 +12,9 @@ use crate::state::view::FitMode;
     name = "remage",
     version,
     about = "Keyboard-centric image viewer",
+    long_about = "A keyboard-centric, GPU-rendered image viewer with vim-style keys, a thumbnail \
+                  grid, user commands and an IPC socket. With no paths it opens the current \
+                  directory; a single file opens its whole directory, starting on that file.",
     args_conflicts_with_subcommands = true
 )]
 pub struct Cli {
@@ -132,6 +135,16 @@ pub enum Sub {
         )]
         action: Vec<String>,
     },
+
+    /// Print a shell completion script
+    Completions {
+        #[arg(value_enum)]
+        shell: clap_complete::Shell,
+    },
+
+    /// Print the man page (roff)
+    #[command(hide = true)]
+    Man,
 }
 
 fn parse_geometry(s: &str) -> Result<(u32, u32), String> {
@@ -179,6 +192,17 @@ mod tests {
         let c = Cli::try_parse_from(["remage", "--slideshow=3"]).unwrap();
         assert_eq!(c.slideshow, Some(Some(3.0)));
         assert_eq!(Cli::try_parse_from(["remage"]).unwrap().slideshow, None);
+    }
+
+    #[test]
+    fn completions_subcommand() {
+        let c = Cli::try_parse_from(["remage", "completions", "zsh"]).unwrap();
+        assert!(matches!(
+            c.command,
+            Some(Sub::Completions {
+                shell: clap_complete::Shell::Zsh
+            })
+        ));
     }
 
     #[test]

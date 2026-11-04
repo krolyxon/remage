@@ -27,6 +27,7 @@ impl ToSrgb {
     }
 
     /// From H.273 code points (AVIF/HEIF `nclx`). sRGB/BT.709 and unspecified need nothing.
+    #[cfg_attr(not(feature = "heif"), allow(dead_code))]
     pub fn from_cicp(primaries: u8, transfer: u8) -> Option<Self> {
         let primaries = CicpColorPrimaries::try_from(primaries).ok()?;
         if matches!(

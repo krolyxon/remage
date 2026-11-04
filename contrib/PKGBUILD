@@ -1,0 +1,72 @@
+# Maintainer: krolyxon <me@krolyxon.com>
+pkgname=remage-git
+_pkgname=remage
+pkgver=0.1.0.r0.g0000000
+pkgrel=1
+pkgdesc='Keyboard-centric, GPU-rendered image viewer with vim keys and wallpaper theming'
+arch=('x86_64' 'aarch64')
+url='https://github.com/krolyxon/remage'
+license=('AGPL-3.0-only' 'OFL-1.1')
+depends=('gcc-libs' 'glibc' 'dav1d' 'libheif' 'libxkbcommon' 'wayland' 'vulkan-icd-loader')
+makedepends=('cargo' 'git' 'pkgconf')
+optdepends=(
+  'libx11: X11 support'
+  'libxcursor: X11 cursors'
+  'libxi: X11 input'
+  'libxrandr: X11 scaling'
+  'mesa: OpenGL fallback'
+  'imagemagick: [[decoders]] for PSD, XCF, JP2 and others'
+  'wl-clipboard: the example copy command'
+  'matugen: wallpaper theming'
+  'python-pywal: wallpaper theming'
+)
+provides=("$_pkgname")
+conflicts=("$_pkgname")
+options=('!lto')
+source=("git+$url.git")
+sha256sums=('SKIP')
+
+pkgver() {
+  cd "$_pkgname"
+  printf '%s.r%s.g%s' \
+    "$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)" \
+    "$(git rev-list --count HEAD)" \
+    "$(git rev-parse --short HEAD)"
+}
+
+prepare() {
+  cd "$_pkgname"
+  export RUSTUP_TOOLCHAIN=stable
+  cargo fetch --locked --target "$(rustc -vV | sed -n 's/host: //p')"
+}
+
+build() {
+  cd "$_pkgname"
+  export RUSTUP_TOOLCHAIN=stable
+  export CARGO_TARGET_DIR=target
+  cargo build --frozen --release
+  target/release/remage man > remage.1
+  target/release/remage completions zsh > _remage
+  target/release/remage completions bash > remage.bash
+  target/release/remage completions fish > remage.fish
+}
+
+check() {
+  cd "$_pkgname"
+  export RUSTUP_TOOLCHAIN=stable
+  cargo test --frozen --release
+}
+
+package() {
+  cd "$_pkgname"
+  install -Dm755 target/release/remage -t "$pkgdir/usr/bin/"
+  install -Dm644 remage.1 -t "$pkgdir/usr/share/man/man1/"
+  install -Dm644 _remage -t "$pkgdir/usr/share/zsh/site-functions/"
+  install -Dm644 remage.bash "$pkgdir/usr/share/bash-completion/completions/remage"
+  install -Dm644 remage.fish -t "$pkgdir/usr/share/fish/vendor_completions.d/"
+  install -Dm644 contrib/remage.desktop -t "$pkgdir/usr/share/applications/"
+  install -Dm644 README.md contrib/config.example.toml -t "$pkgdir/usr/share/doc/$_pkgname/"
+  cp -r contrib/matugen contrib/pywal "$pkgdir/usr/share/doc/$_pkgname/"
+  install -Dm644 LICENSE -t "$pkgdir/usr/share/licenses/$pkgname/"
+  install -Dm644 assets/fonts/OFL.txt "$pkgdir/usr/share/licenses/$pkgname/OFL-fonts.txt"
+}

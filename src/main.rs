@@ -10,6 +10,7 @@ mod decode;
 mod exec;
 mod input;
 mod ipc;
+mod man;
 mod render;
 mod scan;
 mod state;
@@ -35,19 +36,30 @@ fn main() -> anyhow::Result<()> {
     let started = Instant::now();
     env_logger::init();
     let cli = cli::Cli::parse();
-    if let Some(cli::Sub::Msg {
-        pid,
-        query,
-        subscribe,
-        action,
-    }) = cli.command
-    {
-        std::process::exit(ipc::client(ipc::ClientArgs {
+    match cli.command {
+        Some(cli::Sub::Msg {
             pid,
             query,
             subscribe,
             action,
-        }));
+        }) => {
+            std::process::exit(ipc::client(ipc::ClientArgs {
+                pid,
+                query,
+                subscribe,
+                action,
+            }));
+        }
+        Some(cli::Sub::Completions { shell }) => {
+            let mut cmd = <cli::Cli as clap::CommandFactory>::command();
+            clap_complete::generate(shell, &mut cmd, "remage", &mut std::io::stdout());
+            return Ok(());
+        }
+        Some(cli::Sub::Man) => {
+            man::render(&mut std::io::stdout().lock())?;
+            return Ok(());
+        }
+        None => {}
     }
     if cli.dump_config {
         print!("{}", config::dump());

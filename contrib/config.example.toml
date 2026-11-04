@@ -1,0 +1,86 @@
+# Example remage config: copy to ~/.config/remage/config.toml and trim to taste.
+#
+# Your file is merged over the compiled-in defaults, so only list what you change.
+# `remage --dump-config` prints every option with its default, and
+# `remage --check-config` validates this file. Changes apply live.
+
+# Theme from the wallpaper. See contrib/matugen/ (or use [theme] pywal = … below).
+include = ["~/.cache/matugen/remage.toml"]
+
+[general]
+sort = "natural"
+start_mode = "image"
+
+[image]
+fit = "down"
+alpha_background = "dots"
+slideshow_delay = 4.0
+
+[grid]
+size = 160
+names = false
+
+[ui]
+statusbar_right = "{format}  {width}×{height}  {zoom}%  {index}/{count}"
+
+[theme]
+preset = "nothing-dark"
+# pywal = "~/.cache/wal/colors.json"
+
+# ── User commands ─────────────────────────────────────────────────────────────────────────
+# These replace nsxiv's key-handler (`d`, `w` and `c` used to run through C-x). They act on
+# the marked files if there are any, otherwise on the current one.
+
+[commands.delete]
+desc = "Delete files"
+run = ["rm", "--", "{files}"]
+confirm = "Delete {count} file(s)?"   # asks inline: y deletes, any other key cancels
+# after = "refresh" is the default, so deleted files drop out of the queue at once.
+
+[commands.wallpaper]
+desc = "Set as wallpaper"
+run = ["setwall", "-p", "{file}"]
+targets = "current"
+output = "ignore"
+
+[commands.copy]
+desc = "Copy image"
+run = "wl-copy --type image/png < {file}"   # X11: xclip -sel c -t image/png < {file}
+targets = "current"
+
+[commands.copy-path]
+desc = "Copy file paths"
+run = "printf '%s\\n' {files} | wl-copy"
+
+[commands.rotate]
+desc = "Rotate files 90° clockwise (re-encodes them)"
+run = ["magick", "mogrify", "-rotate", "90", "{files}"]
+# The default `after = "refresh"` re-decodes the rotated files.
+
+[commands.gimp]
+desc = "Open in GIMP"
+run = ["gimp", "{files}"]
+output = "ignore"
+after = []
+
+# An unmodified nsxiv key-handler still works if you'd rather keep it:
+# [commands.legacy-delete]
+# run = ["~/.config/nsxiv/exec/key-handler", "d"]
+# stdin = "files"
+
+[keys.global]
+"<Space>d" = "run delete"
+"<Space>w" = "run wallpaper"
+"<Space>c" = "run copy"
+"<Space>y" = "run copy-path"
+"<Space>r" = "run rotate"
+"<Space>g" = "run gimp"
+
+[keys.image]
+"<C-ScrollUp>" = "next"
+"<C-ScrollDown>" = "prev"
+
+# Anything without a built-in decoder, via ImageMagick.
+[[decoders]]
+match = ["*.psd", "*.xcf", "*.jp2"]
+run = ["magick", "{file}[0]", "png:-"]

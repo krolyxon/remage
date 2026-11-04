@@ -1,0 +1,39 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+# A newer push to the same branch or PR supersedes the running check.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    name: fmt, clippy, test
+    runs-on: ubuntu-latest
+    # Arch has current dav1d and libheif, the two system libraries the default features need.
+    container: archlinux:latest
+    steps:
+      - name: Install system dependencies
+        run: |
+          pacman -Syu --noconfirm --needed base-devel git pkgconf rustup \
+            dav1d libheif libxkbcommon wayland
+          rustup default stable
+          rustup component add rustfmt clippy
+      - uses: actions/checkout@v7
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --check
+      - run: cargo clippy --all-targets --locked -- -D warnings
+      - run: cargo test --locked
+      - name: Build without C dependencies
+        run: cargo clippy --all-targets --locked --no-default-features --features jxl,svg,raw -- -D warnings
+      - name: Man page and completions render
+        run: |
+          cargo run --locked -q -- man | grep -q '^.SH KEYS'
+          cargo run --locked -q -- completions zsh | grep -q '^#compdef remage'

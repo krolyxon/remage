@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=remage
+GenericName=Image Viewer
+Comment=Keyboard-centric image viewer
+Exec=remage %F
+Icon=image-viewer
+Terminal=false
+StartupWMClass=remage
+Categories=Graphics;Viewer;2DGraphics;RasterGraphics;
+Keywords=image;picture;photo;viewer;gallery;
+MimeType=image/jpeg;image/png;image/apng;image/gif;image/webp;image/bmp;image/x-bmp;image/x-ms-bmp;image/vnd.microsoft.icon;image/x-icon;image/tiff;image/x-tga;image/x-targa;image/x-portable-anymap;image/x-portable-bitmap;image/x-portable-graymap;image/x-portable-pixmap;image/qoi;image/x-qoi;image/vnd.ms-dds;image/x-dds;image/vnd.radiance;image/x-hdr;image/x-exr;image/jxl;image/avif;image/heic;image/heif;image/heic-sequence;image/heif-sequence;image/svg+xml;image/svg+xml-compressed;image/x-dcraw;image/x-adobe-dng;image/x-canon-cr2;image/x-canon-cr3;image/x-canon-crw;image/x-nikon-nef;image/x-nikon-nrw;image/x-sony-arw;image/x-sony-sr2;image/x-sony-srf;image/x-fuji-raf;image/x-olympus-orf;image/x-panasonic-rw2;image/x-panasonic-raw;image/x-pentax-pef;image/x-samsung-srw;image/x-sigma-x3f;image/x-kodak-dcr;image/x-kodak-kdc;image/x-minolta-mrw;image/x-epson-erf;image/x-hasselblad-3fr;image/x-leaf-mos;image/x-mamiya-mef;image/x-phaseone-iiq;

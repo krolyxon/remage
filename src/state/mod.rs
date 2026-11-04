@@ -1216,8 +1216,9 @@ impl AppState {
             .unwrap_or_else(|| self.view.display_scale(now) > view::NEAREST_ABOVE)
     }
 
+    /// The grid never waits on a full decode, so a load left over from image mode stays quiet.
     pub fn loading_visible(&self, now: Instant) -> bool {
-        self.loading_since.is_some_and(|t| now >= t + LOADING_DELAY)
+        !self.in_grid() && self.loading_since.is_some_and(|t| now >= t + LOADING_DELAY)
     }
 
     /// Whether frames must keep coming (animations, held keys).
@@ -1249,7 +1250,7 @@ impl AppState {
                 wake(m.until);
             }
         }
-        if let Some(t) = self.loading_since {
+        if let Some(t) = self.loading_since.filter(|_| !self.in_grid()) {
             let at = t + LOADING_DELAY;
             if now < at {
                 wake(at);
@@ -1326,6 +1327,16 @@ mod tests {
         assert!(!s.apply(Action::Last, now).navigated);
         assert!(s.apply(Action::Goto(1), now).navigated);
         assert_eq!(s.queue.index(), 0);
+    }
+
+    #[test]
+    fn grid_hides_a_pending_load() {
+        let (mut s, now) = state(3);
+        s.loading_since = Some(now);
+        let later = now + LOADING_DELAY;
+        assert!(s.loading_visible(later));
+        s.set_mode(Mode::Grid, now);
+        assert!(!s.loading_visible(later));
     }
 
     #[test]

@@ -20,7 +20,9 @@ mod svg;
 use std::fs::File;
 use std::io::Read;
 use std::path::Path;
-use std::sync::{Arc, LazyLock};
+#[cfg(feature = "svg")]
+use std::sync::Arc;
+use std::sync::LazyLock;
 use std::time::Duration;
 
 use anyhow::anyhow;
@@ -148,6 +150,7 @@ impl std::fmt::Debug for DecodedImage {
 pub struct Options {
     /// About how many pixels the longer side needs, for sources that can be rendered at any
     /// size (SVG) or offer a preview (RAW).
+    #[cfg_attr(not(any(feature = "svg", feature = "raw")), allow(dead_code))]
     pub target: u32,
     pub auto_orient: bool,
     pub color: bool,
