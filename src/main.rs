@@ -17,12 +17,13 @@ mod thumbs;
 mod ui;
 mod worker;
 
+use std::path::Path;
 use std::time::Instant;
 
 use clap::Parser;
 use winit::event_loop::EventLoop;
 
-use app::{App, Options, UserEvent};
+use app::{App, Options, Overrides, UserEvent};
 use state::queue::Queue;
 use state::{AppState, MsgKind, Settings};
 
@@ -30,15 +31,37 @@ fn main() -> anyhow::Result<()> {
     let started = Instant::now();
     env_logger::init();
     let cli = cli::Cli::parse();
+    if cli.dump_config {
+        print!("{}", config::dump());
+        return Ok(());
+    }
+    if cli.check_config {
+        check_config(cli.config.as_deref());
+    }
     log::info!("remage {}", env!("CARGO_PKG_VERSION"));
+
+    let (loaded, config_error) = match config::load(cli.config.as_deref()) {
+        Ok(l) => (l, None),
+        Err(e) => {
+            log::error!("{e}");
+            let mut d = config::defaults();
+            d.watch = e.watch;
+            (d, Some(e.message))
+        }
+    };
+    for w in &loaded.warnings {
+        log::warn!("{w}");
+    }
+    log::debug!("config loaded after {:.1?}", started.elapsed());
+    let cfg = &loaded.config;
 
     let scan = scan::scan(
         &cli.paths,
         &scan::ScanOptions {
-            recursive: cli.recursive,
-            siblings: !cli.no_siblings,
-            sort: cli.sort,
-            reverse: cli.reverse,
+            recursive: cli.recursive || cfg.general.recursive,
+            siblings: !cli.no_siblings && cfg.general.open_siblings,
+            sort: cli.sort.unwrap_or(cfg.general.sort),
+            reverse: cli.reverse || cfg.general.reverse,
         },
     );
     log::debug!(
@@ -48,14 +71,20 @@ fn main() -> anyhow::Result<()> {
         started.elapsed()
     );
 
-    let settings = Settings {
-        fit: cli.fit.unwrap_or(Settings::default().fit),
+    let overrides = Overrides {
+        fit: cli.fit,
         zoom: cli.zoom.map(|z| z / 100.0),
-        ..Settings::default()
+        bar: cli.no_bar.then_some(false),
     };
+    let mut settings = Settings::from_config(cfg);
+    overrides.apply(&mut settings);
     let start_index = cli.start.unwrap_or(1).saturating_sub(1);
     let queue = Queue::new(scan.files, scan.start.as_deref(), start_index);
-    let mut state = AppState::new(queue, settings, !cli.no_bar, Instant::now());
+    let bar = overrides.bar.unwrap_or(cfg.ui.statusbar);
+    let mut state = AppState::new(queue, settings, bar, Instant::now());
+    state.theme = loaded.theme.clone();
+    state.nearest = cfg.image.filter.nearest();
+    state.alpha_bg = cfg.image.alpha_background;
     if let Some(err) = scan.errors.first() {
         state.notify(format!("error: {err}"), MsgKind::Error, Instant::now());
     }
@@ -72,17 +101,47 @@ fn main() -> anyhow::Result<()> {
             }
         });
     }
+    let watch = {
+        let proxy = proxy.clone();
+        config::watch::spawn(cli.config.clone(), loaded.watch.clone(), move |r| {
+            let _ = proxy.send_event(UserEvent::Config(Box::new(r)));
+        })
+    };
 
     let opts = Options {
-        fullscreen: cli.fullscreen,
+        fullscreen: cli.fullscreen || cfg.window.fullscreen,
         geometry: cli.geometry,
-        class: cli.class,
-        cache_mb: 512,
+        class: cli.class.unwrap_or_else(|| cfg.window.class.clone()),
+        overrides,
     };
-    let mut app = App::new(opts, state, proxy);
+    let mut app = App::new(opts, state, proxy, loaded, watch);
+    if let Some(e) = config_error {
+        app.config_failed(&e);
+    }
     event_loop.run_app(&mut app)?;
     match app.error.take() {
         Some(e) => Err(e),
         None => Ok(()),
+    }
+}
+
+/// `--check-config`: report and exit, non-zero on errors.
+fn check_config(path: Option<&Path>) -> ! {
+    match config::load(path) {
+        Ok(l) => {
+            for w in &l.warnings {
+                eprintln!("warning: {w}");
+            }
+            match path.map(Path::to_path_buf).or_else(config::default_path) {
+                Some(p) if p.is_file() => println!("{}: ok", p.display()),
+                Some(p) => println!("{} not found: using the defaults", p.display()),
+                None => println!("no config directory: using the defaults"),
+            }
+            std::process::exit(0)
+        }
+        Err(e) => {
+            eprintln!("{e}");
+            std::process::exit(1)
+        }
     }
 }

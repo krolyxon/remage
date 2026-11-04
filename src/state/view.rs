@@ -14,9 +14,21 @@ pub const MAX_SCALE: f32 = 64.0;
 /// Magnification above which `filter = auto` switches to nearest.
 pub const NEAREST_ABOVE: f32 = 3.0;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    Default,
+    PartialEq,
+    Eq,
+    clap::ValueEnum,
+    serde::Deserialize,
+    serde::Serialize,
+)]
+#[serde(rename_all = "lowercase")]
 pub enum FitMode {
     /// Fit, but never enlarge.
+    #[default]
     Down,
     Fit,
     Fill,

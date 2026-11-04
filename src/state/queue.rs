@@ -1,10 +1,23 @@
 //! The file list: current index, ordering and navigation.
 
 use std::cmp::Ordering;
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    Default,
+    PartialEq,
+    Eq,
+    clap::ValueEnum,
+    serde::Deserialize,
+    serde::Serialize,
+)]
+#[serde(rename_all = "lowercase")]
 pub enum SortKey {
+    #[default]
     Natural,
     Name,
     Mtime,
@@ -124,6 +137,38 @@ impl Queue {
             }
         }
         out
+    }
+
+    pub fn files(&self) -> &[PathBuf] {
+        &self.files
+    }
+
+    /// Reverse the order, keeping the current file selected.
+    pub fn reverse(&mut self) {
+        self.files.reverse();
+        self.index = self.clamp(self.files.len().saturating_sub(1) - self.index);
+    }
+
+    /// Adopt a new order of the same files (a finished re-sort), keeping the current file.
+    /// Files removed meanwhile stay removed; files added meanwhile go at the end.
+    pub fn reorder(&mut self, order: Vec<PathBuf>) {
+        let current = self.current().map(Path::to_path_buf);
+        let have: HashSet<&PathBuf> = self.files.iter().collect();
+        let mut files: Vec<PathBuf> = order.into_iter().filter(|f| have.contains(f)).collect();
+        let placed: HashSet<&PathBuf> = files.iter().collect();
+        let missing: Vec<PathBuf> = self
+            .files
+            .iter()
+            .filter(|f| !placed.contains(f))
+            .cloned()
+            .collect();
+        files.extend(missing);
+        self.files = files;
+        if let Some(cur) = current
+            && let Some(i) = self.files.iter().position(|f| *f == cur)
+        {
+            self.index = i;
+        }
     }
 
     fn clamp(&self, i: usize) -> usize {
@@ -286,6 +331,24 @@ mod tests {
         assert_eq!(q.neighbours(2, true), vec![1, 4, 2, 3]);
         let q = Queue::new(paths(&["a", "b"]), None, 0);
         assert_eq!(q.neighbours(2, true), vec![1]);
+    }
+
+    #[test]
+    fn reverse_and_reorder_keep_current() {
+        let mut q = Queue::new(paths(&["a", "b", "c", "d"]), Some(Path::new("b")), 0);
+        q.reverse();
+        assert_eq!(q.files(), paths(&["d", "c", "b", "a"]));
+        assert_eq!(q.current(), Some(Path::new("b")));
+        q.remove(Path::new("d"));
+        q.reorder(paths(&["a", "b", "d", "c"]));
+        assert_eq!(q.files(), paths(&["a", "b", "c"]));
+        assert_eq!(q.current(), Some(Path::new("b")));
+        q.reorder(paths(&["c"]));
+        assert_eq!(q.files(), paths(&["c", "a", "b"]));
+        assert_eq!(q.current(), Some(Path::new("b")));
+        let mut empty = Queue::default();
+        empty.reverse();
+        assert!(empty.is_empty());
     }
 
     #[test]

@@ -1,4 +1,8 @@
-//! Colour tokens, presets and palette derivation.
+//! Colour tokens, presets, palette derivation and pywal import.
+
+use std::path::Path;
+
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 /// An sRGB colour with straight alpha.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -36,24 +40,131 @@ impl Rgba {
             self.0[3] as f32 / 255.0,
         ]
     }
+
+    /// `#RGB`, `#RRGGBB` or `#RRGGBBAA`; the `#` is optional.
+    pub fn parse(s: &str) -> Result<Rgba, String> {
+        let hex = s.trim().strip_prefix('#').unwrap_or(s.trim());
+        let bad = || format!("expected a colour like \"#D71921\", got \"{s}\"");
+        if !hex.chars().all(|c| c.is_ascii_hexdigit()) {
+            return Err(bad());
+        }
+        let byte = |i: usize| u8::from_str_radix(&hex[i..i + 2], 16).map_err(|_| bad());
+        match hex.len() {
+            3 => {
+                let n = |i: usize| u8::from_str_radix(&hex[i..=i], 16).map(|v| v * 17);
+                Ok(Rgba([
+                    n(0).map_err(|_| bad())?,
+                    n(1).map_err(|_| bad())?,
+                    n(2).map_err(|_| bad())?,
+                    255,
+                ]))
+            }
+            6 => Ok(Rgba([byte(0)?, byte(2)?, byte(4)?, 255])),
+            8 => Ok(Rgba([byte(0)?, byte(2)?, byte(4)?, byte(6)?])),
+            _ => Err(bad()),
+        }
+    }
 }
 
-#[derive(Clone, Debug, PartialEq)]
-pub struct Theme {
-    pub background: Rgba,
-    pub foreground: Rgba,
-    pub surface: Rgba,
-    pub surface_raised: Rgba,
-    pub border: Rgba,
-    pub border_visible: Rgba,
-    pub text_disabled: Rgba,
-    pub text_secondary: Rgba,
-    pub text_primary: Rgba,
-    pub text_display: Rgba,
-    pub accent: Rgba,
-    pub success: Rgba,
-    pub warning: Rgba,
-    pub image_background: Rgba,
+impl std::fmt::Display for Rgba {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let [r, g, b, a] = self.0;
+        if a == 255 {
+            write!(f, "#{r:02X}{g:02X}{b:02X}")
+        } else {
+            write!(f, "#{r:02X}{g:02X}{b:02X}{a:02X}")
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for Rgba {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let s = String::deserialize(d)?;
+        Rgba::parse(&s).map_err(serde::de::Error::custom)
+    }
+}
+
+impl Serialize for Rgba {
+    fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(&self.to_string())
+    }
+}
+
+/// Generates the token struct, the optional overrides in `[theme]`, and per-token helpers.
+macro_rules! tokens {
+    ($($name:ident),* $(,)?) => {
+        #[derive(Clone, Debug, PartialEq)]
+        pub struct Theme {
+            $(pub $name: Rgba,)*
+        }
+
+        #[derive(Clone, Debug, Default, PartialEq, Deserialize)]
+        #[serde(default, deny_unknown_fields)]
+        pub struct ThemeConfig {
+            pub preset: Preset,
+            /// pywal's `colors.json`.
+            pub pywal: Option<String>,
+            $(pub $name: Option<Rgba>,)*
+        }
+
+        impl Theme {
+            /// Every token mixed from `self` (t = 0) to `other` (t = 1).
+            pub fn mix(&self, other: &Theme, t: f32) -> Theme {
+                Theme {
+                    $($name: other.$name.mix_over(self.$name, t),)*
+                }
+            }
+
+            fn apply(&mut self, cfg: &ThemeConfig) {
+                $(if let Some(c) = cfg.$name {
+                    self.$name = c;
+                })*
+            }
+        }
+    };
+}
+
+tokens!(
+    background,
+    foreground,
+    surface,
+    surface_raised,
+    border,
+    border_visible,
+    text_disabled,
+    text_secondary,
+    text_primary,
+    text_display,
+    accent,
+    success,
+    warning,
+    image_background,
+);
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Preset {
+    #[default]
+    NothingDark,
+    NothingLight,
+}
+
+impl Preset {
+    /// Background, foreground, accent.
+    fn colors(self) -> [Rgba; 3] {
+        match self {
+            Preset::NothingDark => [
+                Rgba::rgb(0x000000),
+                Rgba::rgb(0xFFFFFF),
+                Rgba::rgb(0xD71921),
+            ],
+            Preset::NothingLight => [
+                Rgba::rgb(0xF5F5F5),
+                Rgba::rgb(0x000000),
+                Rgba::rgb(0xD71921),
+            ],
+        }
+    }
 }
 
 impl Theme {
@@ -80,12 +191,39 @@ impl Theme {
     }
 
     pub fn nothing_dark() -> Self {
-        Self::derive(
-            Rgba::rgb(0x000000),
-            Rgba::rgb(0xFFFFFF),
-            Rgba::rgb(0xD71921),
-        )
+        let [bg, fg, accent] = Preset::NothingDark.colors();
+        Self::derive(bg, fg, accent)
     }
+}
+
+/// Preset, then pywal, then explicit base colours; derive the rest, then explicit tokens win.
+/// `image_background` follows the final background unless set.
+pub fn resolve(cfg: &ThemeConfig, pywal: Option<[Rgba; 3]>) -> Theme {
+    let [mut bg, mut fg, mut accent] = pywal.unwrap_or_else(|| cfg.preset.colors());
+    bg = cfg.background.unwrap_or(bg);
+    fg = cfg.foreground.unwrap_or(fg);
+    accent = cfg.accent.unwrap_or(accent);
+    let mut theme = Theme::derive(bg, fg, accent);
+    theme.apply(cfg);
+    theme
+}
+
+/// Background, foreground and accent from pywal's `colors.json`.
+pub fn read_pywal(path: &Path) -> Result<[Rgba; 3], String> {
+    let src = std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let json: serde_json::Value =
+        serde_json::from_str(&src).map_err(|e| format!("{}: {e}", path.display()))?;
+    let get = |a: &str, b: &str| -> Result<Rgba, String> {
+        let s = json[a][b]
+            .as_str()
+            .ok_or_else(|| format!("{}: missing {a}.{b}", path.display()))?;
+        Rgba::parse(s).map_err(|e| format!("{}: {a}.{b}: {e}", path.display()))
+    };
+    Ok([
+        get("special", "background")?,
+        get("special", "foreground")?,
+        get("colors", "color1")?,
+    ])
 }
 
 #[cfg(test)]
@@ -111,5 +249,82 @@ mod tests {
         assert_eq!(Rgba::rgb(0xFFFFFF).linear(), [1.0, 1.0, 1.0, 1.0]);
         let mid = Rgba::rgb(0x808080).linear()[0];
         assert!((mid - 0.2158).abs() < 1e-3);
+    }
+
+    #[test]
+    fn hex_parsing() {
+        assert_eq!(Rgba::parse("#D71921"), Ok(Rgba::rgb(0xD71921)));
+        assert_eq!(Rgba::parse("d71921"), Ok(Rgba::rgb(0xD71921)));
+        assert_eq!(Rgba::parse("#fff"), Ok(Rgba::rgb(0xFFFFFF)));
+        assert_eq!(Rgba::parse("#00000080"), Ok(Rgba([0, 0, 0, 0x80])));
+        assert!(Rgba::parse("#12345").is_err());
+        assert!(Rgba::parse("#gggggg").is_err());
+        assert!(Rgba::parse("#ÿÿÿ").is_err());
+        assert_eq!(Rgba::rgb(0xD71921).to_string(), "#D71921");
+    }
+
+    #[test]
+    fn resolution_order() {
+        let mut cfg = ThemeConfig::default();
+        assert_eq!(resolve(&cfg, None), Theme::nothing_dark());
+        cfg.preset = Preset::NothingLight;
+        let light = resolve(&cfg, None);
+        assert_eq!(light.background, Rgba::rgb(0xF5F5F5));
+        assert_eq!(light.image_background, Rgba::rgb(0xF5F5F5));
+        assert_eq!(light.text_display, Rgba::rgb(0x000000));
+        // pywal replaces the preset; explicit colours win over pywal.
+        let wal = [
+            Rgba::rgb(0x102030),
+            Rgba::rgb(0xF0E0D0),
+            Rgba::rgb(0x00FF00),
+        ];
+        cfg.accent = Some(Rgba::rgb(0x0000FF));
+        cfg.border = Some(Rgba::rgb(0x123456));
+        let t = resolve(&cfg, Some(wal));
+        assert_eq!(t.background, Rgba::rgb(0x102030));
+        assert_eq!(t.accent, Rgba::rgb(0x0000FF));
+        assert_eq!(t.border, Rgba::rgb(0x123456));
+        assert_eq!(
+            t.surface,
+            Rgba::rgb(0xF0E0D0).mix_over(Rgba::rgb(0x102030), 0.067)
+        );
+    }
+
+    #[test]
+    fn mixing_themes() {
+        let a = Theme::nothing_dark();
+        let b = resolve(
+            &ThemeConfig {
+                preset: Preset::NothingLight,
+                ..Default::default()
+            },
+            None,
+        );
+        assert_eq!(a.mix(&b, 0.0), a);
+        assert_eq!(a.mix(&b, 1.0), b);
+        assert_eq!(a.mix(&b, 0.5).background, Rgba([123, 123, 123, 255]));
+    }
+
+    #[test]
+    fn pywal_import() {
+        let dir = std::env::temp_dir().join(format!("remage-wal-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("colors.json");
+        std::fs::write(
+            &p,
+            r##"{"special":{"background":"#0b0c10","foreground":"#c5c6c7","cursor":"#c5c6c7"},
+                "colors":{"color0":"#0b0c10","color1":"#66fcf1"}}"##,
+        )
+        .unwrap();
+        assert_eq!(
+            read_pywal(&p),
+            Ok([
+                Rgba::rgb(0x0B0C10),
+                Rgba::rgb(0xC5C6C7),
+                Rgba::rgb(0x66FCF1)
+            ])
+        );
+        std::fs::write(&p, "{}").unwrap();
+        assert!(read_pywal(&p).unwrap_err().contains("special.background"));
     }
 }

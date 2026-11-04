@@ -153,6 +153,10 @@ impl Renderer {
         self.text.measure(item)
     }
 
+    pub fn set_font_families(&mut self, families: [String; 3]) {
+        self.text.set_families(families);
+    }
+
     pub fn set_fonts(&mut self, db: glyphon::fontdb::Database) {
         self.text.set_fonts(&self.device, &self.queue, db);
     }

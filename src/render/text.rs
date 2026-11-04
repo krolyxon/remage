@@ -31,14 +31,17 @@ pub enum FontRole {
 }
 
 impl FontRole {
-    fn family(self) -> &'static str {
+    fn index(self) -> usize {
         match self {
-            FontRole::Ui => "Space Grotesk",
-            FontRole::Mono => "Space Mono",
-            FontRole::Display => "Doto",
+            FontRole::Ui => 0,
+            FontRole::Mono => 1,
+            FontRole::Display => 2,
         }
     }
 }
+
+/// The embedded families: UI, mono, display.
+pub const DEFAULT_FAMILIES: [&str; 3] = ["Space Grotesk", "Space Mono", "Doto"];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Align {
@@ -102,6 +105,8 @@ pub struct TextSystem {
     viewport: Viewport,
     format: wgpu::TextureFormat,
     shaped: HashMap<Key, Shaped>,
+    /// Family names per [`FontRole`], from `ui.font_*`.
+    families: [String; 3],
 }
 
 /// Locale for shaping, from the usual environment variables.
@@ -149,6 +154,14 @@ impl TextSystem {
             viewport,
             format,
             shaped: HashMap::new(),
+            families: DEFAULT_FAMILIES.map(String::from),
+        }
+    }
+
+    pub fn set_families(&mut self, families: [String; 3]) {
+        if families != self.families {
+            self.families = families;
+            self.shaped.clear();
         }
     }
 
@@ -175,8 +188,9 @@ impl TextSystem {
         let line_height = (item.size * 1.25).ceil();
         let mut buffer = Buffer::new(&mut self.fonts, Metrics::new(item.size, line_height));
         buffer.set_size(None, None);
+        let family = self.families[item.role.index()].clone();
         let base = Attrs::new()
-            .family(Family::Name(item.role.family()))
+            .family(Family::Name(&family))
             .weight(Weight(item.weight))
             .letter_spacing(item.tracking);
         let spans = item.spans.iter().map(|(s, c)| {

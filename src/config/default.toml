@@ -1,0 +1,175 @@
+# remage configuration — the complete default.
+#
+# Copy only what you want to change into ~/.config/remage/config.toml: your file is merged
+# over these defaults, so a partial file is fine. `remage --check-config` validates it.
+# Changes apply live, and SIGUSR1 or the `reload-config` action reload by hand.
+
+# Files merged before this one, in order; this file wins. `~` and `$VAR` expand, relative
+# paths resolve against this file's directory, and a missing include is only a warning.
+# include = ["~/.cache/matugen/remage.toml"]
+include = []
+
+[general]
+open_siblings = true      # a single file argument opens its whole directory
+recursive = false         # descend into directory arguments
+sort = "natural"          # natural | name | mtime | size | random
+reverse = false
+start_mode = "image"      # image | grid
+wrap = true               # next on the last image goes to the first
+watch_dir = true          # add and drop files that appear or vanish on disk
+
+[window]
+decorations = false
+title = "{name} — remage" # {name} {index} {count}
+class = "remage"          # Wayland app_id / X11 class
+fullscreen = false
+
+[image]
+fit = "down"              # down (fit, never enlarge) | fit | fill | width | height | original
+zoom_step = 1.25
+filter = "auto"           # auto (nearest above 300%) | linear | nearest
+alpha_background = "dots" # dots | checker | solid
+auto_orient = true        # apply EXIF orientation
+color_management = true   # convert ICC / CICP colour to sRGB
+preload = 2               # images decoded and uploaded on each side
+cache_mb = 512            # decoded-image cache budget
+slideshow_delay = 5.0     # seconds
+
+[grid]
+sizes = [96, 128, 160, 224, 320]
+size = 160
+gap = 16
+thumbnail_cache = true    # read and write the shared freedesktop thumbnail cache
+names = false             # filenames under thumbnails
+
+[ui]
+statusbar = true
+which_key_delay_ms = 300
+scale = 1.0               # UI size multiplier on top of the display scale
+statusbar_left = "{name}"
+statusbar_right = "{format}  {width}×{height}  {zoom}%  {index}/{count}"
+info_command = ""         # script whose output fills a status segment
+font_ui = "Space Grotesk"
+font_mono = "Space Mono"
+font_display = "Doto"
+
+[animation]
+enabled = true
+duration_ms = 180
+transition = "fade"       # fade | none
+
+[theme]
+preset = "nothing-dark"   # nothing-dark | nothing-light
+# Read colours from pywal: special.background / special.foreground / colors.color1.
+# pywal = "~/.cache/wal/colors.json"
+#
+# background, foreground and accent are enough; every other token is derived from them.
+# Any token can be set explicitly as "#RRGGBB" or "#RRGGBBAA":
+# background = "#000000"
+# foreground = "#FFFFFF"
+# accent = "#D71921"
+# surface surface_raised border border_visible text_disabled text_secondary
+# text_primary text_display success warning image_background
+
+# Key bindings. Values are an action, an array of actions run in order, or "none" to remove
+# a default. Mode tables override [keys.global]; visual mode also inherits [keys.grid].
+# Notation is vim's: n G <C-x> <S-Tab> <Space>w <CR> <BS> <Esc> <F5> <lt> <Bar>, plus
+# <LeftMouse> <RightMouse> <MiddleMouse> <ScrollUp> <ScrollDown> with modifiers (<C-ScrollUp>).
+# A count typed first applies to the action: 5n, 12G, 3+.
+
+[keys.global]
+"q" = "quit"
+"<CR>" = "mode toggle"
+"n" = "next"
+"p" = "prev"
+"<BS>" = "prev"
+"]" = "next 10"
+"[" = "prev 10"
+"gg" = "first"
+"G" = "last"
+"<Home>" = "first"
+"<End>" = "last"
+"m" = "mark"
+"M" = "invert-marks"
+"u" = "unmark-all"
+"N" = "next-mark"
+"P" = "prev-mark"
+"f" = "fullscreen"
+"b" = "bar"
+"i" = "info"
+"r" = "reload"
+"D" = "remove"
+"s" = "slideshow"
+":" = "palette"
+"/" = "search"
+"?" = "help"
+"<Esc>" = "cancel"
+
+[keys.image]
+"h" = "pan left"
+"j" = "pan down"
+"k" = "pan up"
+"l" = "pan right"
+"<Left>" = "pan left"
+"<Down>" = "pan down"
+"<Up>" = "pan up"
+"<Right>" = "pan right"
+"H" = "pan-edge left"
+"J" = "pan-edge down"
+"K" = "pan-edge up"
+"L" = "pan-edge right"
+"z" = "center"
+"+" = "zoom in"
+"-" = "zoom out"
+"=" = "zoom 100%"
+"w" = "fit fit"
+"W" = "fit fill"
+"e" = "fit width"
+"E" = "fit height"
+"<lt>" = "rotate ccw"
+">" = "rotate cw"
+"|" = "flip h"
+"_" = "flip v"
+"a" = "filter toggle"
+"A" = "alpha-bg cycle"
+"{" = "gamma -"
+"}" = "gamma +"
+"<C-Space>" = "play"
+"<C-n>" = "next-frame"
+"<C-p>" = "prev-frame"
+"<ScrollUp>" = "zoom in"
+"<ScrollDown>" = "zoom out"
+
+[keys.grid]
+"+" = "grid-size +"
+"-" = "grid-size -"
+"v" = "visual"
+
+[keys.visual]
+"m" = "mark on"
+"<Esc>" = "mode grid"
+
+# User commands: bind them as "run <name>"; unbound ones still show in the : palette.
+#
+# [commands.wallpaper]
+# desc = "Set as wallpaper"
+# run = ["setwall", "-p", "{file}"]        # array: exec directly, {files} expands to N args
+#
+# [commands.copy]
+# desc = "Copy image"
+# run = "wl-copy --type image/png < {file}" # string: sh -c, placeholders shell-quoted
+#
+# [commands.delete]
+# desc = "Delete files"
+# run = ["rm", "--", "{files}"]
+# confirm = "Delete {count} file(s)?"
+#
+# Fields: targets = auto | current | marked | all, stdin = none | files | files0,
+# output = status | actions | ignore, after = actions run on success (default "refresh").
+# Placeholders: {file} {files} {dir} {name} {stem} {ext} {index} {count} {width} {height}.
+[commands]
+
+# External decoders for anything else; they write PNG, PPM or TIFF to stdout.
+# [[decoders]]
+# match = ["*.psd"]
+# run = ["magick", "{file}[0]", "png:-"]

@@ -28,6 +28,11 @@ impl ImageCache {
         }
     }
 
+    /// Takes effect at the next insert.
+    pub fn set_budget(&mut self, budget_bytes: usize) {
+        self.budget = budget_bytes;
+    }
+
     pub fn get(&mut self, path: &Path) -> Option<Arc<DecodedImage>> {
         self.clock += 1;
         let slot = self.map.get_mut(path)?;

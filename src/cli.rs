@@ -41,13 +41,13 @@ pub struct Cli {
     #[arg(short = 'g', long, value_name = "WxH", value_parser = parse_geometry)]
     pub geometry: Option<(u32, u32)>,
 
-    /// Wayland app_id / X11 class
-    #[arg(long, value_name = "NAME", default_value = "remage")]
-    pub class: String,
+    /// Wayland app_id / X11 class [default: remage]
+    #[arg(long, value_name = "NAME")]
+    pub class: Option<String>,
 
-    /// Sort order for directory contents
-    #[arg(long, value_enum, value_name = "KEY", default_value = "natural")]
-    pub sort: SortKey,
+    /// Sort order for directory contents [default: natural]
+    #[arg(long, value_enum, value_name = "KEY")]
+    pub sort: Option<SortKey>,
 
     /// Reverse the sort order
     #[arg(long)]
@@ -56,6 +56,18 @@ pub struct Cli {
     /// Open only the named file, not the rest of its directory
     #[arg(long)]
     pub no_siblings: bool,
+
+    /// Config file [default: $XDG_CONFIG_HOME/remage/config.toml]
+    #[arg(short = 'c', long, value_name = "PATH")]
+    pub config: Option<PathBuf>,
+
+    /// Print the full commented default config and exit
+    #[arg(long)]
+    pub dump_config: bool,
+
+    /// Validate the config and exit non-zero on errors
+    #[arg(long)]
+    pub check_config: bool,
 }
 
 fn parse_geometry(s: &str) -> Result<(u32, u32), String> {

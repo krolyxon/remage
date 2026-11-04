@@ -13,14 +13,18 @@ use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoopProxy};
 use winit::keyboard::{ModifiersState, PhysicalKey};
 use winit::window::{Fullscreen, Window, WindowId};
 
-use crate::action::Action;
+use crate::action::{Action, Switch, Zoom};
 use crate::cache::ImageCache;
-use crate::config::theme::Theme;
+use crate::config::watch::ConfigWatch;
+use crate::config::{Config, LoadError, Loaded};
 use crate::decode::{self, DecodedImage};
-use crate::input::{self, Input};
+use crate::input::keymap::{KeyTables, Keymap};
+use crate::input::keys::{Key, Scroll};
+use crate::input::{self};
 use crate::render::{Renderer, text};
-use crate::state::view::Dir;
-use crate::state::{AppState, Effects, MsgKind};
+use crate::scan;
+use crate::state::view::{Dir, FitMode};
+use crate::state::{AppState, Effects, MsgKind, Settings};
 use crate::ui;
 use crate::worker::{JobKey, Pool, Priority};
 
@@ -30,6 +34,13 @@ const UPLOAD_BUDGET: usize = 32 << 20;
 const SHOW_TIMEOUT: Duration = Duration::from_millis(300);
 /// Wheel pixels per zoom step for touchpads.
 const PIXELS_PER_STEP: f32 = 60.0;
+/// An ambiguous key sequence (`g` bound, and `gg` too) resolves after this long, like vim's
+/// `timeoutlen`.
+const SEQUENCE_TIMEOUT: Duration = Duration::from_millis(1000);
+/// A press and release closer than this is a click, not a drag.
+const CLICK_SLOP: f32 = 4.0;
+/// Config errors stay on screen until fixed (or dismissed with `<Esc>`).
+const CONFIG_ERROR_TIME: Duration = Duration::from_secs(3600);
 
 pub enum UserEvent {
     Decoded {
@@ -40,13 +51,36 @@ pub enum UserEvent {
     Found(Vec<PathBuf>),
     /// Embedded plus system fonts, loaded off-thread after the first frame.
     Fonts(glyphon::fontdb::Database),
+    /// The config was reloaded (file change, SIGUSR1 or `reload-config`).
+    Config(Box<Result<Loaded, LoadError>>),
+    /// A re-sort finished: the queue in its new order.
+    Sorted(Vec<PathBuf>),
+}
+
+/// Command-line settings that beat the config, across reloads too.
+#[derive(Clone, Debug, Default)]
+pub struct Overrides {
+    pub fit: Option<FitMode>,
+    pub zoom: Option<f32>,
+    pub bar: Option<bool>,
+}
+
+impl Overrides {
+    pub fn apply(&self, s: &mut Settings) {
+        if let Some(fit) = self.fit {
+            s.fit = fit;
+        }
+        if self.zoom.is_some() {
+            s.zoom = self.zoom;
+        }
+    }
 }
 
 pub struct Options {
     pub fullscreen: bool,
     pub geometry: Option<(u32, u32)>,
     pub class: String,
-    pub cache_mb: usize,
+    pub overrides: Overrides,
 }
 
 struct Gfx {
@@ -58,8 +92,17 @@ struct Gfx {
 pub struct App {
     opts: Options,
     state: AppState,
-    theme: Theme,
-    input: Input,
+    config: Config,
+    keymap: Keymap,
+    watch: ConfigWatch,
+    /// A config error is on the status line.
+    config_error: bool,
+    /// `reload-config` ran, so the next reload is confirmed on screen.
+    reload_requested: bool,
+    /// When the pending key sequence became ambiguous.
+    ambiguous_since: Option<Instant>,
+    /// Actions a held key repeats.
+    repeat: Option<(PhysicalKey, Vec<Action>)>,
     pool: Pool,
     proxy: EventLoopProxy<UserEvent>,
     cache: ImageCache,
@@ -71,6 +114,10 @@ pub struct App {
     modifiers: ModifiersState,
     cursor: [f32; 2],
     dragging: bool,
+    /// Where the left button went down, while it is a click candidate.
+    press: Option<[f32; 2]>,
+    /// Wheel motion not yet turned into whole `<ScrollUp>`/`<ScrollDown>` presses.
+    scroll: [f32; 2],
     held: HashMap<PhysicalKey, Dir>,
     started: Instant,
     shown_window: bool,
@@ -78,13 +125,24 @@ pub struct App {
 }
 
 impl App {
-    pub fn new(opts: Options, state: AppState, proxy: EventLoopProxy<UserEvent>) -> Self {
-        let cache = ImageCache::new(opts.cache_mb << 20);
+    pub fn new(
+        opts: Options,
+        state: AppState,
+        proxy: EventLoopProxy<UserEvent>,
+        loaded: Loaded,
+        watch: ConfigWatch,
+    ) -> Self {
+        let cache = ImageCache::new(loaded.config.image.cache_mb << 20);
         let mut app = Self {
             opts,
             state,
-            theme: Theme::nothing_dark(),
-            input: Input::default(),
+            keymap: keymap(&loaded.keys),
+            config: loaded.config,
+            watch,
+            config_error: false,
+            reload_requested: false,
+            ambiguous_since: None,
+            repeat: None,
             pool: Pool::new(),
             proxy,
             cache,
@@ -96,6 +154,8 @@ impl App {
             modifiers: ModifiersState::empty(),
             cursor: [0.0, 0.0],
             dragging: false,
+            press: None,
+            scroll: [0.0, 0.0],
             held: HashMap::new(),
             started: Instant::now(),
             shown_window: false,
@@ -152,8 +212,6 @@ impl App {
         let now = Instant::now();
         if navigated {
             self.pool.bump_epoch();
-            self.input.cancel();
-            self.state.pending.clear();
         }
         let wanted = self.window_paths();
         self.update_title();
@@ -217,12 +275,80 @@ impl App {
 
     fn update_title(&self) {
         if let Some(g) = &self.gfx {
-            let title = match self.state.queue.current() {
-                Some(p) => format!("{} — remage", ui::file_name(p)),
+            let q = &self.state.queue;
+            let title = match q.current() {
+                Some(p) => self
+                    .config
+                    .window
+                    .title
+                    .replace("{name}", &ui::file_name(p))
+                    .replace("{index}", &(q.index() + 1).to_string())
+                    .replace("{count}", &q.len().to_string()),
                 None => "remage".into(),
             };
             g.window.set_title(&title);
         }
+    }
+
+    /// Show a config error until the config is fixed.
+    pub fn config_failed(&mut self, message: &str) {
+        self.state.notify_for(
+            format!("config error: {}", short_error(message)),
+            MsgKind::Error,
+            Instant::now(),
+            CONFIG_ERROR_TIME,
+        );
+        self.config_error = true;
+        self.request_redraw();
+    }
+
+    /// Adopt a reloaded config. Runtime toggles (bar, filter, alpha background) only change
+    /// when their config value did, so a reload doesn't undo what the user just toggled.
+    fn apply_config(&mut self, loaded: Loaded) {
+        let now = Instant::now();
+        for w in &loaded.warnings {
+            log::warn!("{w}");
+        }
+        let old = std::mem::replace(&mut self.config, loaded.config);
+        let new = &self.config;
+        let mut settings = Settings::from_config(new);
+        self.opts.overrides.apply(&mut settings);
+        let preload_changed = settings.preload != self.state.settings.preload;
+        self.state.set_settings(settings);
+        self.state.set_theme(loaded.theme, now);
+        self.keymap = keymap(&loaded.keys);
+        self.ambiguous_since = None;
+        self.state.pending.clear();
+        self.cache.set_budget(new.image.cache_mb << 20);
+        if old.image.filter != new.image.filter {
+            self.state.nearest = new.image.filter.nearest();
+        }
+        if old.image.alpha_background != new.image.alpha_background {
+            self.state.alpha_bg = new.image.alpha_background;
+        }
+        if old.ui.statusbar != new.ui.statusbar && self.opts.overrides.bar.is_none() {
+            let s = if new.ui.statusbar {
+                Switch::On
+            } else {
+                Switch::Off
+            };
+            self.state.apply(Action::Bar(s), now);
+        }
+        if let Some(g) = &mut self.gfx {
+            if old.window.decorations != new.window.decorations {
+                g.window.set_decorations(new.window.decorations);
+            }
+            g.renderer.set_font_families(font_families(new));
+        }
+        self.update_title();
+        // Silent on routine changes (a new wallpaper palette); confirm fixes and manual reloads.
+        if std::mem::take(&mut self.config_error) || std::mem::take(&mut self.reload_requested) {
+            self.state.notify("config reloaded", MsgKind::Info, now);
+        }
+        if preload_changed {
+            self.sync(false);
+        }
+        self.request_redraw();
     }
 
     fn on_decoded(&mut self, path: PathBuf, result: Result<Arc<DecodedImage>, String>) {
@@ -267,9 +393,20 @@ impl App {
         }
     }
 
-    fn apply(&mut self, action: Action, event_loop: &ActiveEventLoop) {
-        let fx = self.state.apply(action, Instant::now());
-        self.effects(fx, event_loop);
+    /// Run actions in order; `anchor` is the cursor for mouse-triggered ones.
+    fn run(&mut self, actions: Vec<Action>, anchor: Option<[f32; 2]>, el: &ActiveEventLoop) {
+        for action in actions {
+            if action == Action::Cancel {
+                self.keymap.cancel();
+                self.state.pending.clear();
+                self.config_error = false;
+            }
+            let fx = self.state.apply_at(action, anchor, Instant::now());
+            self.effects(fx, el);
+            if fx.quit {
+                return;
+            }
+        }
     }
 
     fn effects(&mut self, fx: Effects, event_loop: &ActiveEventLoop) {
@@ -277,22 +414,56 @@ impl App {
             event_loop.exit();
             return;
         }
-        if fx.fullscreen
+        if let Some(s) = fx.fullscreen
             && let Some(g) = &self.gfx
         {
             let on = g.window.fullscreen().is_some();
-            g.window
-                .set_fullscreen((!on).then_some(Fullscreen::Borderless(None)));
+            let want = match s {
+                Switch::Toggle => !on,
+                Switch::On => true,
+                Switch::Off => false,
+            };
+            if want != on {
+                g.window
+                    .set_fullscreen(want.then_some(Fullscreen::Borderless(None)));
+            }
         }
         if fx.reload {
             self.reload();
         }
+        if fx.reload_config {
+            self.reload_requested = true;
+            self.watch.reload();
+        }
+        if let Some(key) = fx.sort {
+            let mut files = self.state.queue.files().to_vec();
+            let proxy = self.proxy.clone();
+            std::thread::spawn(move || {
+                scan::sort_paths(&mut files, key, false);
+                let _ = proxy.send_event(UserEvent::Sorted(files));
+            });
+        }
         if fx.navigated {
             self.sync(true);
+        } else if fx.reordered {
+            self.sync(false);
         }
         if fx.redraw || fx.layout {
             self.request_redraw();
         }
+    }
+
+    /// Mirror the keymap's pending keys on the status line and arm the ambiguity timeout.
+    fn update_pending(&mut self, now: Instant) {
+        let pending = self.keymap.pending_display();
+        if pending != self.state.pending {
+            self.state.pending = pending;
+            self.request_redraw();
+        }
+        self.ambiguous_since = self
+            .keymap
+            .is_ambiguous(self.state.mode)
+            .then(|| self.ambiguous_since.unwrap_or(now));
     }
 
     fn on_key(&mut self, event: winit::event::KeyEvent, event_loop: &ActiveEventLoop) {
@@ -302,27 +473,100 @@ impl App {
                 self.state.hold_pan(dir, false, now);
                 self.request_redraw();
             }
-            return;
-        }
-        let action = self.input.key(&event.logical_key, self.modifiers);
-        let pending = self.input.pending();
-        if pending != self.state.pending {
-            self.state.pending = pending;
-            self.request_redraw();
-        }
-        let Some(action) = action else { return };
-        if event.repeat && !input::repeats(&action) {
-            return;
-        }
-        if let Action::Pan(dir) = action {
-            if self.state.shown.is_some() {
-                self.held.insert(event.physical_key, dir);
-                self.state.hold_pan(dir, true, now);
-                self.request_redraw();
+            if self
+                .repeat
+                .as_ref()
+                .is_some_and(|(k, _)| *k == event.physical_key)
+            {
+                self.repeat = None;
             }
             return;
         }
-        self.apply(action, event_loop);
+        if event.repeat {
+            // Repeats bypass the trie: only a completed, repeatable binding repeats.
+            if let Some((k, actions)) = &self.repeat
+                && *k == event.physical_key
+            {
+                let actions = actions.clone();
+                self.run(actions, None, event_loop);
+            }
+            return;
+        }
+        let Some(key) = input::key(&event.logical_key, self.modifiers) else {
+            return;
+        };
+        let runs = self.keymap.feed(self.state.mode, key);
+        self.update_pending(now);
+        self.repeat = None;
+        for run in runs {
+            let actions = run.counted();
+            if let [Action::Pan(dir)] = actions[..] {
+                if self.state.shown.is_some() {
+                    self.held.insert(event.physical_key, dir);
+                    self.state.hold_pan(dir, true, now);
+                    self.request_redraw();
+                }
+                continue;
+            }
+            if !actions.is_empty() && actions.iter().all(Action::repeats) {
+                self.repeat = Some((event.physical_key, actions.clone()));
+            }
+            self.run(actions, None, event_loop);
+        }
+    }
+
+    /// A mouse button or wheel notch: bound actions run at the cursor, bypassing sequences.
+    fn on_mouse_key(&mut self, key: Key, event_loop: &ActiveEventLoop) {
+        self.keymap.cancel();
+        self.update_pending(Instant::now());
+        if let Some(actions) = self.keymap.lookup(self.state.mode, &[key]) {
+            let actions = actions.to_vec();
+            self.run(actions, Some(self.cursor), event_loop);
+        }
+    }
+
+    fn on_wheel(&mut self, delta: [f32; 2], event_loop: &ActiveEventLoop) {
+        let now = Instant::now();
+        let [dx, dy] = delta;
+        if dy != 0.0 {
+            let dir = if dy > 0.0 { Scroll::Up } else { Scroll::Down };
+            let key = input::scroll(dir, self.modifiers);
+            // Wheel zoom stays continuous for touchpads rather than stepping per notch.
+            match self.keymap.lookup(self.state.mode, &[key]) {
+                Some([Action::Zoom(Zoom::In(n))]) => {
+                    let steps = dy.abs() * *n as f32;
+                    self.state.zoom_at(steps, self.cursor, now);
+                    self.request_redraw();
+                    return;
+                }
+                Some([Action::Zoom(Zoom::Out(n))]) => {
+                    let steps = -dy.abs() * *n as f32;
+                    self.state.zoom_at(steps, self.cursor, now);
+                    self.request_redraw();
+                    return;
+                }
+                _ => {}
+            }
+        }
+        for (axis, d, pos, neg) in [
+            (0, dx, Scroll::Left, Scroll::Right),
+            (1, dy, Scroll::Up, Scroll::Down),
+        ] {
+            if d == 0.0 {
+                continue;
+            }
+            // Reversing direction drops the leftover fraction.
+            if self.scroll[axis] * d < 0.0 {
+                self.scroll[axis] = 0.0;
+            }
+            self.scroll[axis] += d;
+            while self.scroll[axis].abs() >= 1.0 {
+                let up = self.scroll[axis] > 0.0;
+                self.scroll[axis] -= self.scroll[axis].signum();
+                let key = input::scroll(if up { pos } else { neg }, self.modifiers);
+                self.on_mouse_key(key, event_loop);
+            }
+        }
     }
 
     fn redraw(&mut self) {
@@ -339,9 +583,8 @@ impl App {
         if !self.shown_window {
             g.window.set_visible(true);
         }
-        let scene = ui::scene(&self.state, &self.theme, now, &mut |t| {
-            g.renderer.measure(t)
-        });
+        let theme = self.state.theme_at(now);
+        let scene = ui::scene(&self.state, &theme, now, &mut |t| g.renderer.measure(t));
         let result = g.renderer.render(&scene);
         if let Some(path) = std::env::var_os("REMAGE_SNAPSHOT")
             && !self.state.is_animating(now)
@@ -384,6 +627,37 @@ impl App {
     }
 }
 
+/// A config error trimmed for the status line: `config.toml:2:1: unknown field `fitt`; did you
+/// mean `fit`?` without the directory or the list of every valid field.
+fn short_error(message: &str) -> String {
+    let mut s = match message.split_once(": ") {
+        Some((loc, rest)) if loc.contains('/') => {
+            format!("{}: {rest}", loc.rsplit('/').next().unwrap_or(loc))
+        }
+        _ => message.to_string(),
+    };
+    if let Some(start) = s.find(", expected one of") {
+        let end = s[start..]
+            .find("; did you mean")
+            .map_or(s.len(), |i| start + i);
+        s.replace_range(start..end, "");
+    }
+    s
+}
+
+fn keymap(layers: &[KeyTables]) -> Keymap {
+    let refs: Vec<&KeyTables> = layers.iter().collect();
+    Keymap::new(&refs)
+}
+
+fn font_families(c: &Config) -> [String; 3] {
+    [
+        c.ui.font_ui.clone(),
+        c.ui.font_mono.clone(),
+        c.ui.font_display.clone(),
+    ]
+}
+
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
@@ -420,7 +694,7 @@ impl ApplicationHandler<UserEvent> for App {
         let mut attrs = Window::default_attributes()
             .with_title("remage")
             .with_inner_size(LogicalSize::new(w, h))
-            .with_decorations(false)
+            .with_decorations(self.config.window.decorations)
             .with_visible(false);
         if self.opts.fullscreen {
             attrs = attrs.with_fullscreen(Some(Fullscreen::Borderless(None)));
@@ -442,7 +716,10 @@ impl ApplicationHandler<UserEvent> for App {
             }
         };
         let renderer = match Renderer::new(window.clone(), event_loop.owned_display_handle()) {
-            Ok(r) => r,
+            Ok(mut r) => {
+                r.set_font_families(font_families(&self.config));
+                r
+            }
             Err(e) => {
                 self.error = Some(e.context("initialise GPU"));
                 event_loop.exit();
@@ -477,11 +754,24 @@ impl ApplicationHandler<UserEvent> for App {
                     g.window.request_redraw();
                 }
             }
+            UserEvent::Config(result) => match *result {
+                Ok(loaded) => {
+                    log::info!("config reloaded");
+                    self.apply_config(loaded);
+                }
+                Err(e) => {
+                    log::error!("{e}");
+                    self.config_failed(&e.message);
+                }
+            },
+            UserEvent::Sorted(files) => {
+                self.state.queue.reorder(files);
+                self.sync(false);
+            }
         }
     }
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
-        let now = Instant::now();
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
             WindowEvent::Resized(size) => {
@@ -521,22 +811,35 @@ impl ApplicationHandler<UserEvent> for App {
                 }
                 self.cursor = p;
             }
-            WindowEvent::MouseInput {
-                state,
-                button: MouseButton::Left,
-                ..
-            } => {
-                self.dragging = state == ElementState::Pressed;
+            WindowEvent::MouseInput { state, button, .. } => {
+                let pressed = state == ElementState::Pressed;
+                if button == MouseButton::Left {
+                    // Drag pans; a press and release in place is a `<LeftMouse>` click.
+                    self.dragging = pressed;
+                    if pressed {
+                        self.press = Some(self.cursor);
+                        return;
+                    }
+                    let Some(p) = self.press.take() else { return };
+                    let moved = (self.cursor[0] - p[0]).hypot(self.cursor[1] - p[1]);
+                    if moved > CLICK_SLOP * self.state.scale_factor() {
+                        return;
+                    }
+                } else if !pressed {
+                    return;
+                }
+                if let Some(key) = input::button(button, self.modifiers) {
+                    self.on_mouse_key(key, event_loop);
+                }
             }
             WindowEvent::MouseWheel { delta, .. } => {
-                let steps = match delta {
-                    MouseScrollDelta::LineDelta(_, y) => y,
-                    MouseScrollDelta::PixelDelta(p) => p.y as f32 / PIXELS_PER_STEP,
+                let d = match delta {
+                    MouseScrollDelta::LineDelta(x, y) => [x, y],
+                    MouseScrollDelta::PixelDelta(p) => {
+                        [p.x as f32 / PIXELS_PER_STEP, p.y as f32 / PIXELS_PER_STEP]
+                    }
                 };
-                if steps != 0.0 {
-                    self.state.zoom_at(steps, self.cursor, now);
-                    self.request_redraw();
-                }
+                self.on_wheel(d, event_loop);
             }
             _ => {}
         }
@@ -551,7 +854,20 @@ impl ApplicationHandler<UserEvent> for App {
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
         let now = Instant::now();
         let busy = self.pump_uploads();
+        if let Some(t) = self.ambiguous_since
+            && now >= t + SEQUENCE_TIMEOUT
+        {
+            let runs = self.keymap.timeout(self.state.mode);
+            self.update_pending(now);
+            for run in runs {
+                self.run(run.counted(), None, event_loop);
+            }
+        }
         let (redraw, mut next) = self.state.tick(now);
+        if let Some(t) = self.ambiguous_since {
+            let at = t + SEQUENCE_TIMEOUT;
+            next = Some(next.map_or(at, |n| n.min(at)));
+        }
         if redraw {
             self.request_redraw();
         }
@@ -564,5 +880,25 @@ impl ApplicationHandler<UserEvent> for App {
             (false, Some(t)) => ControlFlow::WaitUntil(t),
             (false, None) => ControlFlow::Wait,
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn config_errors_are_shortened_for_the_bar() {
+        assert_eq!(
+            short_error(
+                "/home/u/.config/remage/config.toml:2:1: unknown field `fitt`, expected one of \
+                 `fit`, `zoom_step`; did you mean `fit`?"
+            ),
+            "config.toml:2:1: unknown field `fitt`; did you mean `fit`?"
+        );
+        assert_eq!(
+            short_error("a.toml:1:1: unknown field `x`, expected `y`"),
+            "a.toml:1:1: unknown field `x`, expected `y`"
+        );
     }
 }

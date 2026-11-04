@@ -1,0 +1,15 @@
+# pywal template for remage.
+#
+# remage can read pywal's colors.json directly, which needs no template:
+#     [theme]
+#     pywal = "~/.cache/wal/colors.json"
+#
+# To go through a template instead (to pick other colours), copy this file to
+# ~/.config/wal/templates/remage.toml and add to ~/.config/remage/config.toml:
+#     include = ["~/.cache/wal/remage.toml"]
+#
+# remage watches the include, so `wal -i <image>` recolours open windows.
+[theme]
+background = "{background}"
+foreground = "{foreground}"
+accent     = "{color1}"

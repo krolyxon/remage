@@ -1,173 +1,120 @@
-//! Keyboard and mouse input: vim key notation and per-mode keymaps.
-//!
-//! Until the configurable keymap lands (M2), [`Input`] holds the default bindings in code.
+//! Keyboard and mouse input: vim key notation, per-mode keymaps, and the bridge from winit.
 
 pub mod keymap;
 pub mod keys;
 
-use winit::keyboard::{Key, ModifiersState, NamedKey};
+use winit::event::MouseButton;
+use winit::keyboard::{Key as WinitKey, ModifiersState, NamedKey};
 
-use crate::action::{Action, Zoom};
-use crate::state::view::{Axis, Dir, FitMode};
+use keys::{Button, Code, Key, Mods, Named, Scroll};
 
-#[derive(Debug, Default)]
-pub struct Input {
-    /// A `g` is waiting for its second key.
-    pending_g: bool,
-    /// A count prefix (`5n`, `12G`).
-    count: Option<usize>,
+pub fn mods(m: ModifiersState) -> Mods {
+    Mods {
+        ctrl: m.control_key(),
+        alt: m.alt_key(),
+        shift: m.shift_key(),
+        sup: m.super_key(),
+    }
 }
 
-impl Input {
-    /// The incomplete sequence typed so far, for the status bar.
-    pub fn pending(&self) -> String {
-        let mut s = self.count.map(|c| c.to_string()).unwrap_or_default();
-        if self.pending_g {
-            s.push('g');
-        }
-        s
-    }
-
-    pub fn cancel(&mut self) {
-        self.pending_g = false;
-        self.count = None;
-    }
-
-    /// Map a key press to an action using the default bindings.
-    pub fn key(&mut self, key: &Key, mods: ModifiersState) -> Option<Action> {
-        if mods.control_key() || mods.alt_key() || mods.super_key() {
-            return None;
-        }
-        if let Key::Character(s) = key {
-            // `0` is a motion unless a count is already pending.
-            if let Some(d) = s.chars().next().and_then(|c| c.to_digit(10))
-                && s.len() == 1
-                && !self.pending_g
-                && (d != 0 || self.count.is_some())
-            {
-                self.count = Some(
-                    self.count
-                        .unwrap_or(0)
-                        .saturating_mul(10)
-                        .saturating_add(d as usize)
-                        .min(9_999_999),
-                );
-                return None;
+/// A key press in vim terms. Modifier keys on their own, dead keys and unnamed keys give `None`.
+pub fn key(key: &WinitKey, m: ModifiersState) -> Option<Key> {
+    let code = match key {
+        WinitKey::Character(s) => {
+            let mut chars = s.chars();
+            match (chars.next(), chars.next()) {
+                (Some(c), None) => Code::Char(c),
+                _ => return None,
             }
         }
-        let was_g = std::mem::take(&mut self.pending_g);
-        if !was_g && matches!(key, Key::Character(s) if s == "g") {
-            self.pending_g = true;
-            return None;
-        }
-        let count = self.count.take();
-        let n = count.unwrap_or(1);
-        let action = match key {
-            Key::Character(s) => match s.as_str() {
-                "g" => count.map_or(Action::First, Action::Goto),
-                "q" => Action::Quit,
-                "n" => Action::Next(n),
-                "p" => Action::Prev(n),
-                "]" => Action::Next(10 * n),
-                "[" => Action::Prev(10 * n),
-                "G" => count.map_or(Action::Last, Action::Goto),
-                "h" => Action::Pan(Dir::Left),
-                "j" => Action::Pan(Dir::Down),
-                "k" => Action::Pan(Dir::Up),
-                "l" => Action::Pan(Dir::Right),
-                "H" => Action::PanEdge(Dir::Left),
-                "J" => Action::PanEdge(Dir::Down),
-                "K" => Action::PanEdge(Dir::Up),
-                "L" => Action::PanEdge(Dir::Right),
-                "+" => Action::Zoom(Zoom::In),
-                "-" => Action::Zoom(Zoom::Out),
-                "=" => Action::Zoom(Zoom::Percent(100.0)),
-                "w" => Action::Fit(FitMode::Fit),
-                "W" => Action::Fit(FitMode::Fill),
-                "e" => Action::Fit(FitMode::Width),
-                "E" => Action::Fit(FitMode::Height),
-                "z" => Action::Center,
-                "<" => Action::Rotate(-1),
-                ">" => Action::Rotate(1),
-                "|" => Action::Flip(Axis::Horizontal),
-                "_" => Action::Flip(Axis::Vertical),
-                "a" => Action::FilterToggle,
-                "A" => Action::AlphaBgCycle,
-                "f" => Action::Fullscreen,
-                "b" => Action::BarToggle,
-                "r" => Action::Reload,
-                "D" => Action::Remove,
-                _ => return None,
-            },
-            Key::Named(named) => match named {
-                NamedKey::Backspace => Action::Prev(n),
-                NamedKey::Escape => Action::Cancel,
-                NamedKey::ArrowLeft => Action::Pan(Dir::Left),
-                NamedKey::ArrowDown => Action::Pan(Dir::Down),
-                NamedKey::ArrowUp => Action::Pan(Dir::Up),
-                NamedKey::ArrowRight => Action::Pan(Dir::Right),
-                NamedKey::Home => Action::First,
-                NamedKey::End => Action::Last,
-                _ => return None,
-            },
-            _ => return None,
-        };
-        Some(action)
-    }
+        WinitKey::Named(n) => Code::Named(match n {
+            NamedKey::Space => Named::Space,
+            NamedKey::Enter => Named::Enter,
+            NamedKey::Escape => Named::Esc,
+            NamedKey::Tab => Named::Tab,
+            NamedKey::Backspace => Named::Backspace,
+            NamedKey::Delete => Named::Delete,
+            NamedKey::Insert => Named::Insert,
+            NamedKey::Home => Named::Home,
+            NamedKey::End => Named::End,
+            NamedKey::PageUp => Named::PageUp,
+            NamedKey::PageDown => Named::PageDown,
+            NamedKey::ArrowUp => Named::Up,
+            NamedKey::ArrowDown => Named::Down,
+            NamedKey::ArrowLeft => Named::Left,
+            NamedKey::ArrowRight => Named::Right,
+            other => {
+                return function_key(*other)
+                    .map(Named::F)
+                    .map(|f| Key::new(mods(m), Code::Named(f)));
+            }
+        }),
+        _ => return None,
+    };
+    Some(Key::new(mods(m), code))
 }
 
-/// Whether holding the key should repeat the action.
-pub fn repeats(action: &Action) -> bool {
-    matches!(
-        action,
-        Action::Next(_) | Action::Prev(_) | Action::Zoom(Zoom::In | Zoom::Out)
-    )
+fn function_key(n: NamedKey) -> Option<u8> {
+    use NamedKey::*;
+    const F: [NamedKey; 35] = [
+        F1, F2, F3, F4, F5, F6, F7, F8, F9, F10, F11, F12, F13, F14, F15, F16, F17, F18, F19, F20,
+        F21, F22, F23, F24, F25, F26, F27, F28, F29, F30, F31, F32, F33, F34, F35,
+    ];
+    F.iter().position(|f| *f == n).map(|i| i as u8 + 1)
+}
+
+pub fn button(b: MouseButton, m: ModifiersState) -> Option<Key> {
+    let b = match b {
+        MouseButton::Left => Button::Left,
+        MouseButton::Right => Button::Right,
+        MouseButton::Middle => Button::Middle,
+        MouseButton::Back => Button::Back,
+        MouseButton::Forward => Button::Forward,
+        MouseButton::Other(_) => return None,
+    };
+    Some(Key::new(mods(m), Code::Mouse(b)))
+}
+
+pub fn scroll(dir: Scroll, m: ModifiersState) -> Key {
+    Key::new(mods(m), Code::Scroll(dir))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use keys::KeySeq;
 
-    fn ch(s: &str) -> Key {
-        Key::Character(s.into())
+    fn k(s: &str) -> Key {
+        s.parse::<KeySeq>().unwrap().0[0]
     }
 
     #[test]
-    fn gg_is_a_sequence() {
-        let mut input = Input::default();
+    fn winit_keys_match_notation() {
         let none = ModifiersState::empty();
-        assert_eq!(input.key(&ch("g"), none), None);
-        assert_eq!(input.pending(), "g");
-        assert_eq!(input.key(&ch("g"), none), Some(Action::First));
-        assert_eq!(input.key(&ch("g"), none), None);
-        assert_eq!(input.key(&ch("n"), none), Some(Action::Next(1)));
-        assert_eq!(input.pending(), "");
-    }
-
-    #[test]
-    fn counts() {
-        let mut input = Input::default();
-        let none = ModifiersState::empty();
-        for k in ["1", "2"] {
-            assert_eq!(input.key(&ch(k), none), None);
-        }
-        assert_eq!(input.pending(), "12");
-        assert_eq!(input.key(&ch("G"), none), Some(Action::Goto(12)));
-        assert_eq!(input.key(&ch("3"), none), None);
-        assert_eq!(input.key(&ch("n"), none), Some(Action::Next(3)));
-        assert_eq!(input.key(&ch("G"), none), Some(Action::Last));
-        // `0` alone is not a count.
-        assert_eq!(input.key(&ch("0"), none), None);
-        assert_eq!(input.pending(), "");
-        input.key(&ch("5"), none);
-        input.key(&ch("g"), none);
-        assert_eq!(input.pending(), "5g");
-        assert_eq!(input.key(&ch("g"), none), Some(Action::Goto(5)));
-    }
-
-    #[test]
-    fn modifiers_block_plain_bindings() {
-        let mut input = Input::default();
-        assert_eq!(input.key(&ch("n"), ModifiersState::CONTROL), None);
+        let ch = |s: &str| WinitKey::Character(s.into());
+        assert_eq!(key(&ch("n"), none), Some(k("n")));
+        // Shift is already in the character.
+        assert_eq!(key(&ch("G"), ModifiersState::SHIFT), Some(k("G")));
+        assert_eq!(key(&ch("?"), ModifiersState::SHIFT), Some(k("?")));
+        assert_eq!(key(&ch("x"), ModifiersState::CONTROL), Some(k("<C-x>")));
+        assert_eq!(key(&ch(" "), none), Some(k("<Space>")));
+        assert_eq!(
+            key(&WinitKey::Named(NamedKey::Space), ModifiersState::CONTROL),
+            Some(k("<C-Space>"))
+        );
+        assert_eq!(
+            key(&WinitKey::Named(NamedKey::Tab), ModifiersState::SHIFT),
+            Some(k("<S-Tab>"))
+        );
+        assert_eq!(key(&WinitKey::Named(NamedKey::F5), none), Some(k("<F5>")));
+        assert_eq!(
+            key(&WinitKey::Named(NamedKey::Shift), ModifiersState::SHIFT),
+            None
+        );
+        assert_eq!(button(MouseButton::Right, none), Some(k("<RightMouse>")));
+        assert_eq!(
+            scroll(Scroll::Up, ModifiersState::CONTROL),
+            k("<C-ScrollUp>")
+        );
     }
 }

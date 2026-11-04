@@ -430,7 +430,7 @@ Each milestone should end with a usable binary.
   - winit + wgpu window, decoding through the `image` crate.
   - Fit/zoom/pan/rotate/flip with animation, and `n`/`p`.
   - Preload + cache, a status bar with text, and the `nothing-dark` theme with hard-coded keys.
-- **M2 Input + config**
+- **M2 Input + config** ✓ (2026-11-04). Unbuilt actions parse and bind, then say "not available yet".
   - Action grammar, and a keymap trie with sequences, counts and mouse bindings.
   - TOML defaults, include and live reload, plus `--dump-config` and `--check-config`.
   - Theme tokens, presets and derivation; matugen + pywal support.

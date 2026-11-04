@@ -46,7 +46,7 @@ pub fn scene<'a>(
     now: Instant,
     measure: &mut dyn FnMut(&TextItem) -> f32,
 ) -> Scene<'a> {
-    let sf = state.scale_factor();
+    let sf = state.ui_scale();
     let [w, h] = state.window();
     let bar_h = state.bar_height();
     let mut scene = Scene {
@@ -138,7 +138,7 @@ fn status_bar(
     bar_h: f32,
     measure: &mut dyn FnMut(&TextItem) -> f32,
 ) {
-    let sf = state.scale_factor();
+    let sf = state.ui_scale();
     let pad = 16.0 * sf;
     let y = h - bar_h * 0.5;
     scene.prims.push(Prim::rect(
@@ -185,7 +185,7 @@ fn status_bar(
         info.push(format!("{:0digits$}/{count}", state.queue.index() + 1));
     }
     if !info.is_empty() {
-        spans.push((info.join("  "), theme.text_secondary));
+        spans.push((info.join("  ").to_uppercase(), theme.text_secondary));
     }
     // Two spaces between segments, attached to the preceding span so colours stay put.
     let n = spans.len();
@@ -195,10 +195,8 @@ fn status_bar(
     let mut right_w = 0.0;
     if !spans.is_empty() {
         let mut item = label("", theme.text_secondary, sf, w - pad, y, Align::Right);
-        item.spans = spans
-            .into_iter()
-            .map(|(s, c)| (s.to_uppercase(), c))
-            .collect();
+        // Already in caps, except pending keys: `g` and `G` are different keys.
+        item.spans = spans;
         right_w = measure(&item);
         scene.texts.push(item);
     }

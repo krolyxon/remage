@@ -58,6 +58,11 @@ pub fn scan(args: &[PathBuf], opts: &ScanOptions) -> Scan {
 }
 
 fn sort(files: &mut [PathBuf], opts: &ScanOptions) {
+    sort_paths(files, opts.sort, opts.reverse);
+}
+
+/// Sort with the filesystem metadata the stat-based keys need. Can be slow: not on the UI thread.
+pub fn sort_paths(files: &mut [PathBuf], key: SortKey, reverse: bool) {
     let meta = |p: &Path| {
         std::fs::metadata(p).map_or((0, 0), |m| {
             let mtime = m
@@ -71,7 +76,7 @@ fn sort(files: &mut [PathBuf], opts: &ScanOptions) {
     let seed = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(1, |d| d.as_nanos() as u64);
-    sort_files(files, opts.sort, opts.reverse, meta, seed);
+    sort_files(files, key, reverse, meta, seed);
 }
 
 /// Collect visible files under `dir`. Symlinked directories are not followed.
