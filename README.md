@@ -8,7 +8,6 @@
 [![License](https://img.shields.io/github/license/krolyxon/remage?style=flat-square&labelColor=000000&color=333333)](LICENSE)
 [![Platform](https://img.shields.io/badge/platform-Linux%20(Wayland%20%7C%20X11)-333333?style=flat-square&labelColor=000000)](#install)
 [![Renderer](https://img.shields.io/badge/GPU-wgpu-D71921?style=flat-square&labelColor=000000)](https://wgpu.rs)
-[![nsxiv](https://img.shields.io/badge/replaces-nsxiv-333333?style=flat-square&labelColor=000000)](https://codeberg.org/nsxiv/nsxiv)
 [![Last commit](https://img.shields.io/github/last-commit/krolyxon/remage?style=flat-square&labelColor=000000&color=333333)](https://github.com/krolyxon/remage/commits)
 
 </div>
