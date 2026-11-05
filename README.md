@@ -78,7 +78,8 @@ The tarball also holds zsh/bash/fish completions, the desktop file and the examp
 
 ### Arch Linux
 
-A `remage-git` PKGBUILD lives in [`contrib/PKGBUILD`](contrib/PKGBUILD):
+A `remage-bin` PKGBUILD lives in [`contrib/PKGBUILD`](contrib/PKGBUILD). It packages the
+latest release binary from GitHub:
 
 ```bash
 git clone https://github.com/krolyxon/remage
