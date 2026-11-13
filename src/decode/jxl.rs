@@ -62,6 +62,7 @@ pub fn decode(path: &Path, opts: &Options) -> anyhow::Result<DecodedImage> {
         frames,
         format: "JXL",
         source_size: size,
+        orientation: image::metadata::Orientation::NoTransforms,
         refine: None,
     })
 }

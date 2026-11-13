@@ -520,7 +520,6 @@ impl App {
         if !self.state.in_grid() {
             return;
         }
-        let Some(g) = &mut self.gfx else { return };
         let px = self.state.cell_px();
         if px != self.thumbs.cell {
             for p in self.thumbs.requested.drain().map(|(p, _)| p) {
@@ -528,7 +527,10 @@ impl App {
             }
             self.thumbs.arrivals.clear();
             self.state.thumbs.clear();
-            g.renderer.reset_thumbs(px);
+            // Before the GPU exists, thumbnails wait in `arrivals` for an atlas of this size.
+            if let Some(g) = &mut self.gfx {
+                g.renderer.reset_thumbs(px);
+            }
             self.thumbs.cell = px;
         }
         let l = self.state.grid_layout();
@@ -2062,9 +2064,18 @@ impl ApplicationHandler<UserEvent> for App {
                 return;
             }
         };
+        let size = window.inner_size();
+        self.state.set_window(
+            size.width as f32,
+            size.height as f32,
+            window.scale_factor() as f32,
+        );
+        // The grid's size is known now: thumbnails load while the GPU starts up.
+        self.sync_thumbs();
         let renderer = match Renderer::new(window.clone(), event_loop.owned_display_handle()) {
             Ok(mut r) => {
                 r.set_font_families(font_families(&self.config));
+                r.reset_thumbs(self.thumbs.cell);
                 r
             }
             Err(e) => {
@@ -2074,14 +2085,13 @@ impl ApplicationHandler<UserEvent> for App {
             }
         };
         log::debug!("GPU ready after {:.1?}", self.started.elapsed());
-        let size = window.inner_size();
-        self.state.set_window(
-            size.width as f32,
-            size.height as f32,
-            window.scale_factor() as f32,
-        );
         self.gfx = Some(Gfx { renderer, window });
         self.sync(false);
+    }
+
+    fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
+        // The window goes at once; whatever else is still winding down does so unseen.
+        self.gfx = None;
     }
 
     fn user_event(&mut self, event_loop: &ActiveEventLoop, event: UserEvent) {

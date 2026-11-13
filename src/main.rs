@@ -195,6 +195,8 @@ fn main() -> anyhow::Result<()> {
         app.config_failed(&e);
     }
     event_loop.run_app(&mut app)?;
+    // Decode workers are abandoned mid-job from here on.
+    thumbs::finish_writes();
     if cli.print_marked
         && let Some(marked) = app.marked_output()
     {

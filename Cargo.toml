@@ -1,6 +1,6 @@
 [package]
 name = "remage"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 description = "Keyboard-centric image viewer with a Nothing-inspired look"
 rust-version = "1.96"
@@ -43,6 +43,8 @@ tiff = "0.11.3"
 toml = "1.2.0"
 wgpu = "30"
 winit = "0.30"
+zune-core = "0.5.3"
+zune-jpeg = "0.5.15"
 
 [features]
 default = ["jxl", "svg", "avif", "heif", "raw"]

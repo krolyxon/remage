@@ -68,6 +68,13 @@ pub fn decode_file(
     if let Some(img) = animated {
         return Ok(img);
     }
+    if format == ImageFormat::Jpeg {
+        match decode_jpeg(path, opts) {
+            Ok(Some(img)) => return Ok(img),
+            Ok(None) => {}
+            Err(e) => log::debug!("fast JPEG path failed, retrying: {e:#}"),
+        }
+    }
     let mut img = decode_reader(open()?, format, opts)?;
     if format == ImageFormat::Tiff {
         add_tiff_pages(path, &mut img, opts);
@@ -75,7 +82,53 @@ pub fn decode_file(
     Ok(img)
 }
 
-/// A still image from any reader: ICC to sRGB, float tone-mapped, oriented upright.
+/// JPEG straight to RGBA through zune-jpeg. `image` would hand over RGB, and widening 24 MP
+/// costs a quarter of the decode again. `None` for the colour spaces (CMYK, YCCK, plain RGB)
+/// that zune-jpeg can't write as RGBA; those go the long way.
+fn decode_jpeg(path: &Path, opts: &Options) -> anyhow::Result<Option<DecodedImage>> {
+    use zune_core::colorspace::ColorSpace;
+    let data = std::fs::read(path)?;
+    let options = zune_core::options::DecoderOptions::default()
+        .set_strict_mode(false)
+        .set_max_width(usize::MAX)
+        .set_max_height(usize::MAX)
+        .jpeg_set_out_colorspace(ColorSpace::RGBA);
+    let mut d = zune_jpeg::JpegDecoder::new_with_options(
+        zune_core::bytestream::ZCursor::new(data.as_slice()),
+        options,
+    );
+    d.decode_headers()?;
+    if !matches!(
+        d.input_colorspace(),
+        Some(ColorSpace::YCbCr | ColorSpace::Luma)
+    ) {
+        return Ok(None);
+    }
+    let (w, h) = d.dimensions().context("no JPEG header")?;
+    if (w as u64) * (h as u64) * 4 > MAX_ALLOC {
+        return Err(anyhow!("image too large"));
+    }
+    let orientation = d
+        .exif()
+        .filter(|_| opts.auto_orient)
+        .and_then(|e| Orientation::from_exif_chunk(e))
+        .unwrap_or(Orientation::NoTransforms);
+    let icc = if opts.color { d.icc_profile() } else { None };
+    let mut pixels = d.decode()?;
+    if pixels.len() != w * h * 4 {
+        return Err(anyhow!("JPEG decoded to an unexpected size"));
+    }
+    if let Some(t) = icc.as_deref().and_then(ToSrgb::from_icc) {
+        t.apply(&mut pixels);
+    }
+    let size = [w as u32, h as u32];
+    Ok(Some(
+        DecodedImage::still(size, pixels, label(ImageFormat::Jpeg)).turned(orientation),
+    ))
+}
+
+/// A still image from any reader: ICC to sRGB, float tone-mapped. Orientation is left to the
+/// renderer.
 pub fn decode_reader<R: BufRead + Seek>(
     reader: R,
     format: ImageFormat,
@@ -101,8 +154,7 @@ pub fn decode_reader<R: BufRead + Seek>(
     if !float && let Some(t) = icc.as_deref().and_then(ToSrgb::from_icc) {
         t.apply(&mut pixels);
     }
-    let (size, pixels) = color::orient(size, pixels, orientation);
-    Ok(DecodedImage::still(size, pixels, label(format)))
+    Ok(DecodedImage::still(size, pixels, label(format)).turned(orientation))
 }
 
 /// Decode from memory, guessing the format from the bytes (external decoders' output).
@@ -112,7 +164,7 @@ pub fn decode_bytes(bytes: &[u8], opts: &Options) -> anyhow::Result<DecodedImage
 }
 
 /// All frames of an animation, or `None` when it has only one (decode it as a still, which
-/// keeps its orientation).
+/// knows its orientation).
 fn animation<'a>(
     decoder: impl AnimationDecoder<'a>,
     icc: Option<Vec<u8>>,
@@ -155,12 +207,14 @@ fn animation<'a>(
                 format: label(format),
                 source_size: size,
                 refine: None,
+                orientation: Orientation::NoTransforms,
             }))
         }
     }
 }
 
-/// Pages after the first, as extra (untimed) frames. Pages of another size are skipped.
+/// Pages after the first, as extra (untimed) frames. Pages of another size or orientation
+/// are skipped.
 fn add_tiff_pages(path: &Path, img: &mut DecodedImage, opts: &Options) {
     let Ok(file) = File::open(path) else { return };
     let Ok(mut d) = tiff::decoder::Decoder::new(BufReader::new(file)) else {
@@ -173,10 +227,8 @@ fn add_tiff_pages(path: &Path, img: &mut DecodedImage, opts: &Options) {
         }
         match tiff_page(&mut d) {
             Ok((size, pixels)) => {
-                // `image` rotated the first page; rotate the rest the same way.
-                let o = orientation_of(&mut d, opts);
-                let (size, pixels) = color::orient(size, pixels, o);
-                if size != img.size {
+                // Every frame shares the first page's texture and placement.
+                if size != img.size || orientation_of(&mut d, opts) != img.orientation {
                     log::debug!("TIFF page of another size skipped");
                     continue;
                 }
@@ -265,6 +317,39 @@ mod tests {
             "a zero delay plays at the browser pace"
         );
         assert_eq!(img.frame(1)[0], 0);
+    }
+
+    #[test]
+    fn jpeg_fast_path() {
+        use image::codecs::jpeg::JpegEncoder;
+        let dir = dir();
+        // Grey and colour both come out as opaque RGBA.
+        let grey = dir.join("grey.jpg");
+        let buf = image::GrayImage::from_pixel(16, 8, image::Luma([200]));
+        JpegEncoder::new_with_quality(File::create(&grey).unwrap(), 95)
+            .encode_image(&buf)
+            .unwrap();
+        let img = decode_jpeg(&grey, &Options::default()).unwrap().unwrap();
+        assert_eq!((img.size, img.pixels().len()), ([16, 8], 16 * 8 * 4));
+        let p = &img.pixels()[..4];
+        assert!(p[0].abs_diff(200) <= 2 && p[0] == p[1] && p[1] == p[2] && p[3] == 255);
+
+        let rgb = dir.join("rgb.jpg");
+        let buf = image::RgbImage::from_pixel(16, 8, image::Rgb([250, 10, 10]));
+        JpegEncoder::new_with_quality(File::create(&rgb).unwrap(), 95)
+            .encode_image(&buf)
+            .unwrap();
+        let img = decode_file(&rgb, ImageFormat::Jpeg, &Options::default()).unwrap();
+        let p = &img.pixels()[..4];
+        assert!(p[0] > 235 && p[1] < 30 && p[2] < 30 && p[3] == 255, "{p:?}");
+        // The same pixels as the long way round.
+        let slow = decode_reader(
+            BufReader::new(File::open(&rgb).unwrap()),
+            ImageFormat::Jpeg,
+            &Options::default(),
+        )
+        .unwrap();
+        assert_eq!(img.pixels(), slow.pixels());
     }
 
     #[test]

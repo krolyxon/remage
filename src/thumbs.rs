@@ -8,6 +8,7 @@ use std::fs::{self, File};
 use std::io::{BufReader, BufWriter, Write};
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::{Component, Path, PathBuf};
+use std::sync::RwLock;
 use std::time::UNIX_EPOCH;
 
 use anyhow::{Context, anyhow, bail};
@@ -232,6 +233,15 @@ fn percent_decode(s: &str) -> Vec<u8> {
     out
 }
 
+/// Set once the process is on its way out.
+static WRITES_CLOSED: RwLock<bool> = RwLock::new(false);
+
+/// Wait for thumbnails being written and refuse new ones. Workers aren't joined on exit, so
+/// this is what keeps temporary files from being left in the shared cache.
+pub fn finish_writes() {
+    *WRITES_CLOSED.write().unwrap_or_else(|e| e.into_inner()) = true;
+}
+
 /// Write a PNG atomically (temporary file, then rename) with mode 0600.
 fn write_png(path: &Path, thumb: &Thumb, text: &[(&str, String)]) -> anyhow::Result<()> {
     let dir = path.parent().context("cache path has no parent")?;
@@ -245,6 +255,11 @@ fn write_png(path: &Path, thumb: &Thumb, text: &[(&str, String)]) -> anyhow::Res
         name.to_string_lossy(),
         std::process::id()
     ));
+    // Held to the end, so quitting never kills a write half-way (see `finish_writes`).
+    let closed = WRITES_CLOSED.read().unwrap_or_else(|e| e.into_inner());
+    if *closed {
+        bail!("shutting down");
+    }
     let result = (|| -> anyhow::Result<()> {
         let file = fs::OpenOptions::new()
             .write(true)
@@ -411,13 +426,18 @@ fn generate(path: &Path, max: u32) -> anyhow::Result<Generated> {
     let img = decode::decode(path, &opts)?;
     let source_size = img.source_size;
     let DecodedImage {
-        size, mut frames, ..
+        size,
+        mut frames,
+        orientation,
+        ..
     } = img;
     let pixels = frames.swap_remove(0).pixels;
     let t = resize(Thumb { size, pixels }, max)?;
+    // Turning the thumbnail is much cheaper than turning the image.
+    let (size, pixels) = decode::color::orient(t.size, t.pixels, orientation);
     Ok(Generated {
-        size: t.size,
-        pixels: t.pixels,
+        size,
+        pixels,
         source_size,
     })
 }

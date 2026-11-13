@@ -109,9 +109,9 @@ impl Shared {
     }
 }
 
+/// The workers run detached: nothing ever waits for them.
 pub struct Pool {
     shared: Arc<Shared>,
-    threads: Vec<thread::JoinHandle<()>>,
 }
 
 impl Pool {
@@ -129,16 +129,14 @@ impl Pool {
             queue: Mutex::new(Queue::default()),
             cv: Condvar::new(),
         });
-        let threads = (0..n)
-            .map(|i| {
-                let shared = shared.clone();
-                thread::Builder::new()
-                    .name(format!("remage-worker-{i}"))
-                    .spawn(move || worker(&shared))
-                    .expect("spawn worker thread")
-            })
-            .collect();
-        Self { shared, threads }
+        for i in 0..n {
+            let shared = shared.clone();
+            thread::Builder::new()
+                .name(format!("remage-worker-{i}"))
+                .spawn(move || worker(&shared))
+                .expect("spawn worker thread");
+        }
+        Self { shared }
     }
 
     /// Queue `work` under `key` unless that key is already running.
@@ -173,12 +171,11 @@ impl Pool {
 }
 
 impl Drop for Pool {
+    /// Idle workers stop; busy ones are left to it. This only happens on the way out, and
+    /// quitting must not wait for a decode nobody will see.
     fn drop(&mut self) {
         self.shared.lock().shutdown = true;
         self.shared.cv.notify_all();
-        for t in self.threads.drain(..) {
-            let _ = t.join();
-        }
     }
 }
 

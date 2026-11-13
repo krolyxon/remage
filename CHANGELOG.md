@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.1.1] - 2026-11-13
+
+**Faster**
+- Start-up initialises only the GPU backend that worked last time (remembered in
+  `$XDG_CACHE_HOME/remage/backend`): the first frame takes about 40 ms instead of 90.
+- JPEGs decode straight to RGBA, EXIF rotation happens on the GPU, and sRGB profiles are no longer
+  "converted" to sRGB: a rotated, tagged 24 MP photo decodes in about 80 ms instead of 180.
+- Other ICC profiles convert on several threads.
+- The grid requests thumbnails while the GPU starts up: a cached grid opens in about 55 ms.
+- Quitting no longer waits for decodes in flight.
+
 ## [0.1.0] - 2026-11-05
 
 The first release: a keyboard-centric image viewer for Linux, at nsxiv parity with vim keys,

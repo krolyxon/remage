@@ -57,7 +57,11 @@ impl ToSrgb {
             Layout::Rgba,
             TransformOptions::default(),
         ) {
-            Ok(t) => Some(Self(t)),
+            Ok(t) => {
+                let t = Self(t);
+                // Most tagged files carry some flavour of the sRGB profile.
+                (!t.is_identity()).then_some(t)
+            }
             Err(e) => {
                 log::debug!("colour transform unavailable: {e:?}");
                 None
@@ -65,13 +69,54 @@ impl ToSrgb {
         }
     }
 
-    /// Convert RGBA8 pixels in place; alpha is untouched.
-    pub fn apply(&self, pixels: &mut [u8]) {
-        let src = pixels.to_vec();
-        if let Err(e) = self.0.transform(&src, pixels) {
-            log::debug!("colour transform failed: {e:?}");
-            pixels.copy_from_slice(&src);
+    /// Whether the transform leaves colours alone, to within rounding (an sRGB source).
+    fn is_identity(&self) -> bool {
+        const STEPS: [u8; 9] = [0, 32, 64, 96, 128, 160, 192, 224, 255];
+        let mut src = Vec::with_capacity((STEPS.len().pow(3) + 256) * 4);
+        for r in STEPS {
+            for g in STEPS {
+                for b in STEPS {
+                    src.extend([r, g, b, 255]);
+                }
+            }
         }
+        for v in 0..=255 {
+            src.extend([v, v, v, 255]);
+        }
+        let mut dst = vec![0; src.len()];
+        self.0.transform(&src, &mut dst).is_ok()
+            && src.iter().zip(&dst).all(|(a, b)| a.abs_diff(*b) <= 1)
+    }
+
+    /// Convert RGBA8 pixels in place; alpha is untouched. Large images are split across a
+    /// few threads.
+    pub fn apply(&self, pixels: &mut [u8]) {
+        /// Pixels are converted through a scratch buffer of this many bytes.
+        const CHUNK: usize = 64 << 10;
+        /// Bytes that make another thread worth starting.
+        const PER_THREAD: usize = 4 << 20;
+        let band = |band: &mut [u8]| {
+            let mut scratch = [0u8; CHUNK];
+            for chunk in band.chunks_mut(CHUNK) {
+                let src = &mut scratch[..chunk.len()];
+                src.copy_from_slice(chunk);
+                if let Err(e) = self.0.transform(src, chunk) {
+                    log::debug!("colour transform failed: {e:?}");
+                    chunk.copy_from_slice(src);
+                }
+            }
+        };
+        let cores = std::thread::available_parallelism().map_or(1, |n| n.get());
+        let threads = (pixels.len() / PER_THREAD).clamp(1, cores.min(4));
+        if threads == 1 {
+            return band(pixels);
+        }
+        let len = (pixels.len() / 4).div_ceil(threads) * 4;
+        std::thread::scope(|s| {
+            for part in pixels.chunks_mut(len) {
+                s.spawn(|| band(part));
+            }
+        });
     }
 }
 
@@ -124,11 +169,33 @@ pub fn is_float(img: &DynamicImage) -> bool {
 /// Straight RGBA8 from any decoded image, tone-mapping float data.
 pub fn to_rgba8(img: DynamicImage) -> ([u32; 2], Vec<u8>) {
     let size = [img.width(), img.height()];
-    if is_float(&img) {
-        let f = img.into_rgba32f();
-        (size, tonemap(f.as_raw()))
-    } else {
-        (size, img.into_rgba8().into_raw())
+    match img {
+        DynamicImage::ImageRgb8(rgb) => (size, expand(rgb.as_raw(), 3)),
+        img if is_float(&img) => (size, tonemap(img.into_rgba32f().as_raw())),
+        img => (size, img.into_rgba8().into_raw()),
+    }
+}
+
+/// Whether an orientation turns the image on its side, swapping width and height.
+pub fn swaps_axes(o: Orientation) -> bool {
+    use Orientation::*;
+    matches!(o, Rotate90 | Rotate270 | Rotate90FlipH | Rotate270FlipH)
+}
+
+/// Where stored pixels land in the upright image, as a map between unit squares:
+/// `upright = m * stored + t`. The renderer folds this into an image's placement, so
+/// rotated photos are never turned on the CPU.
+pub fn orient_uv(o: Orientation) -> ([f32; 4], [f32; 2]) {
+    use Orientation::*;
+    match o {
+        NoTransforms => ([1.0, 0.0, 0.0, 1.0], [0.0, 0.0]),
+        Rotate90 => ([0.0, -1.0, 1.0, 0.0], [1.0, 0.0]),
+        Rotate180 => ([-1.0, 0.0, 0.0, -1.0], [1.0, 1.0]),
+        Rotate270 => ([0.0, 1.0, -1.0, 0.0], [0.0, 1.0]),
+        FlipHorizontal => ([-1.0, 0.0, 0.0, 1.0], [1.0, 0.0]),
+        FlipVertical => ([1.0, 0.0, 0.0, -1.0], [0.0, 1.0]),
+        Rotate90FlipH => ([0.0, 1.0, 1.0, 0.0], [0.0, 0.0]),
+        Rotate270FlipH => ([0.0, -1.0, -1.0, 0.0], [1.0, 1.0]),
     }
 }
 
@@ -150,12 +217,18 @@ pub fn orient(size: [u32; 2], pixels: Vec<u8>, o: Orientation) -> ([u32; 2], Vec
 pub fn expand(samples: &[u8], channels: usize) -> Vec<u8> {
     match channels {
         4 => samples.to_vec(),
-        3 => samples
-            .as_chunks::<3>()
-            .0
-            .iter()
-            .flat_map(|p| [p[0], p[1], p[2], 255])
-            .collect(),
+        3 => {
+            let mut out = vec![255; samples.len() / 3 * 4];
+            for (o, p) in out
+                .as_chunks_mut::<4>()
+                .0
+                .iter_mut()
+                .zip(samples.as_chunks::<3>().0)
+            {
+                o[..3].copy_from_slice(p);
+            }
+            out
+        }
         2 => samples
             .as_chunks::<2>()
             .0
@@ -193,6 +266,55 @@ mod tests {
     }
 
     #[test]
+    fn gpu_orientation_matches_the_cpu() {
+        use Orientation::*;
+        // 3×2, every pixel distinct.
+        let (w, h) = (3u32, 2u32);
+        let px: Vec<u8> = (0..w * h).flat_map(|i| [i as u8, 0, 0, 255]).collect();
+        for o in [
+            NoTransforms,
+            Rotate90,
+            Rotate180,
+            Rotate270,
+            FlipHorizontal,
+            FlipVertical,
+            Rotate90FlipH,
+            Rotate270FlipH,
+        ] {
+            let ([uw, uh], upright) = orient([w, h], px.clone(), o);
+            assert_eq!(swaps_axes(o), uw == h, "{o:?}");
+            let (m, t) = orient_uv(o);
+            for y in 0..h {
+                for x in 0..w {
+                    // The stored pixel's centre, mapped into the upright image.
+                    let (u, v) = ((x as f32 + 0.5) / w as f32, (y as f32 + 0.5) / h as f32);
+                    let ux = ((m[0] * u + m[1] * v + t[0]) * uw as f32) as u32;
+                    let uy = ((m[2] * u + m[3] * v + t[1]) * uh as f32) as u32;
+                    let got = upright[((uy * uw + ux) * 4) as usize];
+                    assert_eq!(got, (y * w + x) as u8, "{o:?} at {x},{y}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn srgb_profiles_need_no_transform() {
+        let srgb = ColorProfile::new_srgb().encode().unwrap();
+        assert!(ToSrgb::from_icc(&srgb).is_none());
+        let p3 = ColorProfile::new_display_p3().encode().unwrap();
+        let t = ToSrgb::from_icc(&p3).expect("P3 transform");
+        // Threaded and single-threaded conversion agree, whatever the length.
+        let px: Vec<u8> = (0..(9 << 20) + 4).map(|i| (i * 7 % 256) as u8).collect();
+        let mut big = px.clone();
+        t.apply(&mut big);
+        for at in [0, 4 << 20, px.len() - 8] {
+            let mut small = px[at..at + 8].to_vec();
+            t.apply(&mut small);
+            assert_eq!(small, big[at..at + 8], "at {at}");
+        }
+    }
+
+    #[test]
     fn cicp_and_icc() {
         assert!(ToSrgb::from_cicp(1, 13).is_none(), "BT.709 is already sRGB");
         // Display P3 primaries with the sRGB curve: pure P3 red is outside sRGB.
@@ -203,5 +325,9 @@ mod tests {
         assert!(px[3] == 200);
         assert!(ToSrgb::from_icc(b"not a profile").is_none());
         assert_eq!(expand(&[7, 9], 2), [7, 7, 7, 9]);
+        assert_eq!(
+            expand(&[1, 2, 3, 4, 5, 6, 7], 3),
+            [1, 2, 3, 255, 4, 5, 6, 255]
+        );
     }
 }

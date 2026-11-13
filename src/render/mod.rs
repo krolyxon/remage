@@ -1,6 +1,7 @@
 //! wgpu device and surface setup, and per-frame orchestration.
 
 pub mod atlas;
+mod backend;
 pub mod image;
 pub mod prims;
 pub mod text;
@@ -67,25 +68,7 @@ impl Renderer {
         window: Arc<Window>,
         display: winit::event_loop::OwnedDisplayHandle,
     ) -> anyhow::Result<Self> {
-        let mut desc =
-            wgpu::InstanceDescriptor::new_with_display_handle_from_env(Box::new(display));
-        if wgpu::Backends::from_env().is_none() {
-            desc.backends = wgpu::Backends::VULKAN | wgpu::Backends::GL;
-        }
-        let instance = wgpu::Instance::new(desc);
-        let surface = instance
-            .create_surface(window.clone())
-            .context("create surface")?;
-        let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
-            // The integrated GPU is plenty for images and doesn't wake a sleeping dGPU.
-            power_preference:
-                wgpu::PowerPreference::from_env().unwrap_or(wgpu::PowerPreference::LowPower),
-            compatible_surface: Some(&surface),
-            ..Default::default()
-        }))
-        .context("no suitable GPU adapter")?;
-        let info = adapter.get_info();
-        log::debug!("adapter: {} ({:?})", info.name, info.backend);
+        let (instance, surface, adapter) = Self::adapter(&window, &display)?;
         let limits = wgpu::Limits::downlevel_defaults().using_resolution(adapter.limits());
         // `REMAGE_MAX_TEXTURE` lowers the limit, to exercise tiling on any GPU.
         let max_dim = std::env::var("REMAGE_MAX_TEXTURE")
@@ -155,6 +138,64 @@ impl Renderer {
         })
     }
 
+    /// Find the adapter. The backend that won last time is tried alone first: initialising
+    /// Vulkan and GL together is the slowest part of start-up.
+    fn adapter(
+        window: &Arc<Window>,
+        display: &winit::event_loop::OwnedDisplayHandle,
+    ) -> anyhow::Result<(wgpu::Instance, wgpu::Surface<'static>, wgpu::Adapter)> {
+        let probe = |backends: Option<wgpu::Backends>| {
+            let mut desc = wgpu::InstanceDescriptor::new_with_display_handle_from_env(Box::new(
+                display.clone(),
+            ));
+            if let Some(b) = backends {
+                desc.backends = b;
+            }
+            let instance = wgpu::Instance::new(desc);
+            let surface = instance
+                .create_surface(window.clone())
+                .context("create surface")?;
+            let adapter = pollster::block_on(
+                instance.request_adapter(&wgpu::RequestAdapterOptions {
+                    // The integrated GPU is plenty for images and doesn't wake a sleeping dGPU.
+                    power_preference: wgpu::PowerPreference::from_env()
+                        .unwrap_or(wgpu::PowerPreference::LowPower),
+                    compatible_surface: Some(&surface),
+                    ..Default::default()
+                }),
+            )
+            .context("no suitable GPU adapter")?;
+            anyhow::Ok((instance, surface, adapter))
+        };
+        let remembered = backend::load();
+        if let Some(c) = &remembered {
+            match probe(Some(c.backend.into())) {
+                Ok(found) if found.2.get_info().name == c.adapter => {
+                    log::debug!("adapter: {} ({:?}, remembered)", c.adapter, c.backend);
+                    return Ok(found);
+                }
+                // Another GPU or driver answers now: search again from scratch.
+                Ok(_) => log::debug!("remembered adapter {} is gone", c.adapter),
+                Err(e) => log::debug!("remembered backend {:?} failed: {e:#}", c.backend),
+            }
+        }
+        let env = wgpu::Backends::from_env();
+        let found = probe(
+            env.is_none()
+                .then_some(wgpu::Backends::VULKAN | wgpu::Backends::GL),
+        )?;
+        let info = found.2.get_info();
+        log::debug!("adapter: {} ({:?})", info.name, info.backend);
+        let choice = backend::Choice {
+            backend: info.backend,
+            adapter: info.name,
+        };
+        if !backend::steered() && remembered.as_ref() != Some(&choice) {
+            backend::store(&choice);
+        }
+        Ok(found)
+    }
+
     pub fn resize(&mut self, width: u32, height: u32) {
         if width == 0 || height == 0 {
             return;
@@ -181,13 +222,9 @@ impl Renderer {
     }
 
     /// Upload up to `budget` bytes of `img`. Returns true once it is ready to draw.
-    /// A texture of another size (a re-rasterised SVG, a developed RAW) is replaced.
+    /// A texture of another shape (a re-rasterised SVG, a developed RAW) is replaced.
     pub fn upload(&mut self, path: &Path, img: &DecodedImage, budget: usize) -> bool {
-        if self
-            .textures
-            .get(path)
-            .is_some_and(|g| g.size() != img.size)
-        {
+        if self.textures.get(path).is_some_and(|g| !g.fits(img)) {
             self.textures.remove(path);
         }
         let gpu = match self.textures.get_mut(path) {
@@ -211,7 +248,7 @@ impl Renderer {
         let Some(gpu) = self.textures.get_mut(path) else {
             return;
         };
-        if gpu.size() != img.size {
+        if !gpu.fits(img) {
             return;
         }
         self.images.restart(gpu, frame);

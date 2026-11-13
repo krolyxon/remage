@@ -1,8 +1,8 @@
 //! Format sniffing and dispatch to the decoder backends.
 //!
-//! Every backend returns straight-alpha RGBA8 in sRGB, upright: ICC/CICP colour is converted,
-//! float images are tone-mapped and EXIF orientation is applied here, so nothing downstream
-//! cares where pixels came from.
+//! Every backend returns straight-alpha RGBA8 in sRGB: ICC/CICP colour is converted and float
+//! images are tone-mapped here, so nothing downstream cares where pixels came from. EXIF
+//! orientation is either applied or handed on in [`DecodedImage::orientation`] for the GPU.
 
 pub mod color;
 mod external;
@@ -27,6 +27,7 @@ use std::time::Duration;
 
 use anyhow::anyhow;
 use image::ImageFormat;
+use image::metadata::Orientation;
 
 pub use external::set_decoders;
 
@@ -42,17 +43,20 @@ pub struct Frame {
     pub delay: Duration,
 }
 
-/// Straight-alpha RGBA8 in sRGB, oriented upright, ready to upload.
+/// Straight-alpha RGBA8 in sRGB, ready to upload.
 pub struct DecodedImage {
-    /// Pixel size of every frame.
+    /// Pixel size of every frame, as stored.
     pub size: [u32; 2],
+    /// How the stored pixels turn upright. The renderer does it when drawing; turning 24 MP
+    /// on the CPU takes as long as decoding them.
+    pub orientation: Orientation,
     /// At least one.
     pub frames: Vec<Frame>,
     /// Frames are timed animation rather than pages.
     pub animated: bool,
     pub format: &'static str,
-    /// The size the view works in: the image's own pixels. Scalable or previewed sources
-    /// (SVG, RAW) may hold fewer or more pixels than this.
+    /// The size the view works in: the upright image's own pixels. Scalable or previewed
+    /// sources (SVG, RAW) may hold fewer or more pixels than this.
     pub source_size: [u32; 2],
     /// A sharper version can be made on demand (SVG re-raster, full RAW develop).
     pub refine: Option<Refine>,
@@ -112,7 +116,29 @@ impl DecodedImage {
             format,
             source_size: size,
             refine: None,
+            orientation: Orientation::NoTransforms,
         }
+    }
+
+    /// Stored pixels that still need turning by `o`.
+    pub fn turned(mut self, o: Orientation) -> Self {
+        self.orientation = o;
+        if color::swaps_axes(o) {
+            self.source_size.swap(0, 1);
+        }
+        self
+    }
+
+    /// Every frame turned upright on the CPU.
+    #[cfg(test)]
+    pub fn upright(mut self) -> Self {
+        for f in &mut self.frames {
+            let (size, pixels) =
+                color::orient(self.size, std::mem::take(&mut f.pixels), self.orientation);
+            (self.size, f.pixels) = (size, pixels);
+        }
+        self.orientation = Orientation::NoTransforms;
+        self
     }
 
     pub fn bytes(&self) -> usize {
@@ -334,7 +360,7 @@ fn label(format: ImageFormat) -> &'static str {
     }
 }
 
-/// Decode `path` in full: every frame, colour-converted and upright.
+/// Decode `path` in full: every frame, colour-converted.
 pub fn decode(path: &Path, opts: &Options) -> anyhow::Result<DecodedImage> {
     let head = head(path)?;
     let kind = detect(path, &head).ok_or_else(|| anyhow!("unknown format"))?;
@@ -428,7 +454,9 @@ mod tests {
         }
 
         fn load(name: &str) -> DecodedImage {
-            decode(&fixture(name), &Options::default()).unwrap_or_else(|e| panic!("{name}: {e:#}"))
+            decode(&fixture(name), &Options::default())
+                .unwrap_or_else(|e| panic!("{name}: {e:#}"))
+                .upright()
         }
 
         fn close(a: &[u8], b: [u8; 3], name: &str, what: &str) {
@@ -487,7 +515,11 @@ mod tests {
                 ..Options::default()
             };
             let raw = decode(&fixture("orient-6.jpg"), &opts).unwrap();
-            assert_eq!(raw.size, [12, 16]);
+            assert_eq!((raw.size, raw.source_size), ([12, 16], [12, 16]));
+            // Otherwise the pixels stay as stored and the renderer turns them.
+            let img = decode(&fixture("orient-6.jpg"), &Options::default()).unwrap();
+            assert_eq!(img.orientation, Orientation::Rotate90);
+            assert_eq!((img.size, img.source_size), ([12, 16], [16, 12]));
         }
 
         #[test]

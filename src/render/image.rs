@@ -4,7 +4,7 @@
 use bytemuck::{Pod, Zeroable};
 use wgpu::util::DeviceExt;
 
-use crate::decode::DecodedImage;
+use crate::decode::{DecodedImage, color};
 use crate::state::view::Affine;
 
 const FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8UnormSrgb;
@@ -47,6 +47,8 @@ struct Tile {
 pub struct GpuImage {
     tiles: Vec<Tile>,
     size: [u32; 2],
+    /// Where the stored pixels land in the upright image (see [`color::orient_uv`]).
+    orient: ([f32; 4], [f32; 2]),
     /// The frame these textures hold (or are being filled with).
     frame: usize,
     /// Upload progress: the tile being filled and its rows done.
@@ -64,8 +66,9 @@ impl GpuImage {
         self.frame
     }
 
-    pub fn size(&self) -> [u32; 2] {
-        self.size
+    /// Whether these textures can hold `img`'s frames and draw them the right way up.
+    pub fn fits(&self, img: &DecodedImage) -> bool {
+        self.size == img.size && self.orient == color::orient_uv(img.orientation)
     }
 }
 
@@ -79,6 +82,23 @@ pub fn tiles(size: [u32; 2], max: u32) -> Vec<([u32; 2], [u32; 2])> {
         }
     }
     out
+}
+
+/// `affine` places the upright image; the result places the pixels as stored.
+fn turned(affine: Affine, (om, ot): ([f32; 4], [f32; 2])) -> Affine {
+    let m = affine.m;
+    Affine {
+        m: [
+            m[0] * om[0] + m[1] * om[2],
+            m[0] * om[1] + m[1] * om[3],
+            m[2] * om[0] + m[3] * om[2],
+            m[2] * om[1] + m[3] * om[3],
+        ],
+        t: [
+            affine.t[0] + m[0] * ot[0] + m[1] * ot[1],
+            affine.t[1] + m[2] * ot[0] + m[3] * ot[1],
+        ],
+    }
 }
 
 pub struct ImagePipeline {
@@ -255,6 +275,7 @@ impl ImagePipeline {
         GpuImage {
             tiles,
             size: img.size,
+            orient: color::orient_uv(img.orientation),
             frame: 0,
             tile: 0,
             rows_done: 0,
@@ -442,6 +463,7 @@ impl ImagePipeline {
         let adjust = style.adjust;
         let on = adjust != [1.0, 0.0, 1.0];
         let [iw, ih] = [gpu.size[0] as f32, gpu.size[1] as f32];
+        let affine = turned(affine, gpu.orient);
         let m = affine.m;
         for tile in &gpu.tiles {
             // The tile's corner and extent in the image's 0..1 coordinates.
@@ -476,6 +498,32 @@ impl ImagePipeline {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stored_pixels_are_placed_upright() {
+        use image::metadata::Orientation;
+        // An upright 200×100 image at (10, 20).
+        let upright = Affine {
+            m: [200.0, 0.0, 0.0, 100.0],
+            t: [10.0, 20.0],
+        };
+        let at = |a: Affine, u: f32, v: f32| {
+            [
+                a.m[0] * u + a.m[1] * v + a.t[0],
+                a.m[2] * u + a.m[3] * v + a.t[1],
+            ]
+        };
+        assert_eq!(
+            turned(upright, color::orient_uv(Orientation::NoTransforms)),
+            upright
+        );
+        // Stored on its side, to be turned clockwise: its top-left corner ends up top right
+        // and its top-right corner bottom right.
+        let a = turned(upright, color::orient_uv(Orientation::Rotate90));
+        assert_eq!(at(a, 0.0, 0.0), [210.0, 20.0]);
+        assert_eq!(at(a, 1.0, 0.0), [210.0, 120.0]);
+        assert_eq!(at(a, 0.0, 1.0), [10.0, 20.0]);
+    }
 
     #[test]
     fn tiling_covers_the_image() {
