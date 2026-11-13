@@ -1,7 +1,7 @@
 # Maintainer: krolyxon <me@krolyxon.com>
 pkgname=remage-bin
 _pkgname=remage
-pkgver=0.1.0
+pkgver=0.1.1
 pkgrel=1
 pkgdesc='Keyboard-centric, GPU-rendered image viewer with vim keys and wallpaper theming'
 arch=('x86_64')
@@ -24,7 +24,7 @@ conflicts=("$_pkgname")
 options=('!strip' '!debug')
 _dir="$_pkgname-v$pkgver-x86_64-linux"
 source=("$url/releases/download/v$pkgver/$_dir.tar.gz")
-sha256sums=('d9688a8244eacc2aa4daf6b18cea3244fd3aedcf29d142f2efc3c45fa13912dd')
+sha256sums=('8f7d058b28b7b2e68f42d8aeffc3f5421f2da9eb0f2790f9e0fdd85e46cfca50')
 
 package() {
   cd "$_dir"
